@@ -1,0 +1,7 @@
+[
+  {"id":"old","label":"旧文字","secret":false,"required":false},
+  {"id":"retry","label":"重连","secret":false,"required":false,"type":"switch","default":"true"},
+  {"id":"delay","label":"等待","secret":false,"required":true,"type":"number","default":"5","min":1,"max":60,"unit":"秒","group":{"id":"recovery","label":"恢复","fold":true,"help":"重连时使用","note":"保留隐藏值"},"summaryLabel":"等待","showWhen":{"field":"retry","equals":"true"}},
+  {"id":"token","label":"密钥","secret":false,"required":false,"type":"secret"},
+  {"id":"mode","label":"方式","secret":false,"required":false,"type":"select","default":"fixed","options":[{"value":"fixed","label":"固定"}]}
+]

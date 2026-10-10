@@ -1,0 +1,59 @@
+# ============================================================
+# hhh-im-protocol —— HHH-IM-Protocol 的线上类型、编解码与传输
+#
+# 宿主（hhh-im 的 provider 适配器）和所有外部 IM 插件共用这一份正本。
+# 线上类型独立于 hhh-im 的内部类型定义、独立定版、独立冻结：
+# hhh-im 的内部模型怎么改，都不破坏已经发布的插件（由适配器翻译）。
+#
+# 规范：docs/protocol-v1.md（从 HHH 仓库同步，HHH 仓库是唯一正本）
+#
+#   hhh-im（provider 适配器，feature="provider"）   外部插件（如微信，独立仓库）
+#               ↓ transport                                ↓
+#         hhh-im-protocol（本包）  ← 线上类型 + JSON-RPC 编解码 + 传输 trait
+# ============================================================
+
+[package]
+name = "hhh-im-protocol"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/MagicLizi/hhh-im-sdk"
+description = "HHH-IM-Protocol：HHH 的 IM 插件协议（线上类型、编解码、传输、安装包）"
+
+[features]
+default = []
+# transport：子进程 stdio 传输（tokio）。宿主侧（hhh-im provider 适配器、自检工具）开它；
+# 只用线上类型与编解码的一方可以不开。
+transport = ["dep:tokio"]
+# package：安装包 .hhhim 的打包、读清单与解包（宿主安装与更新、打包工具 hhh-im-pack 用）。
+package = ["dep:zip", "dep:sha2"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+tracing = { version = "0.1" }
+# 子进程、异步读写、计时、通道：只在 transport feature 下用。
+tokio = { version = "1", default-features = false, optional = true, features = ["rt", "process", "io-util", "time", "sync", "macros"] }
+# 安装包：zip 读写与 sha256，只在 package feature 下用。
+zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
+sha2 = { version = "0.11", optional = true }
+
+[dev-dependencies]
+# wiremock：发布（--publish）的端到端测试里当 GitHub、GitLab。
+wiremock = { version = "0.6" }
+# tempfile：测试用的临时目录。
+tempfile = { version = "3" }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
+
+# 自检工具：拿任意插件把协议用例跑一遍。第三方开发者自测、HHH 验收都用它。
+[[bin]]
+name = "hhh-im-check"
+path = "src/bin/hhh_im_check.rs"
+required-features = ["transport"]
+
+# 打包工具：把插件文件夹打成 .hhhim、写版本索引（契约 provider-protocol v10 §4.3）。插件仓库模板的打包脚本用它。
+[[bin]]
+name = "hhh-im-pack"
+path = "src/bin/hhh_im_pack.rs"
+required-features = ["package"]
+
