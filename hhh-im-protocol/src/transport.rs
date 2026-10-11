@@ -144,6 +144,10 @@ impl Connection {
     }
 }
 
+/// Windows 的 `CREATE_NO_WINDOW`：起插件进程不带控制台窗口。
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 fn transport_closed(msg: &str) -> RpcError {
     RpcError {
         code: code::DISCONNECTED,
@@ -208,6 +212,28 @@ async fn read_loop(
 /// 标准输出连续这么多行不是合法消息，就当插件坏了：结束它、关掉连接（protocol-v1 §3）。
 pub const INVALID_LINES_MAX: usize = 3;
 
+/// 起插件进程的命令：三路管道、设 `HHH_IM_PROTOCOL=1`、工作目录为给定临时目录。
+fn plugin_command(
+    program: &str,
+    args: &[String],
+    cwd: &std::path::Path,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env(crate::ENV_FLAG, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // 兜底：句柄真被丢弃时结束子进程。读输出的任务一直拿着句柄，平时靠宿主 `kill_now` / `shutdown` 结束它。
+        .kill_on_drop(true);
+    // Windows：按控制台程序编的插件（模板默认就是）被桌面宿主拉起时会弹出一个黑色控制台窗口；插件只经管道说话，
+    // 不要窗口（CREATE_NO_WINDOW）。
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 /// 按清单启动子进程、走它 stdin/stdout 的传输（protocol-v1 §3）。stderr 每行交给回调（并入宿主日志）。
 pub struct StdioChild {
     stdin: Mutex<tokio::process::ChildStdin>,
@@ -230,16 +256,7 @@ impl StdioChild {
         cwd: &std::path::Path,
         on_log: impl Fn(String) + Send + 'static,
     ) -> std::io::Result<Arc<Self>> {
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args)
-            .current_dir(cwd)
-            .env(crate::ENV_FLAG, "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // 兜底：句柄真被丢弃时结束子进程。读输出的任务一直拿着句柄，平时靠宿主 `kill_now` / `shutdown` 结束它。
-            .kill_on_drop(true);
-        let mut child = cmd.spawn()?;
+        let mut child = plugin_command(program, args, cwd).spawn()?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");

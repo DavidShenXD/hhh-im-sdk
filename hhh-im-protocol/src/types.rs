@@ -13,12 +13,16 @@ use serde::{Deserialize, Serialize};
 pub struct Account {
     /// 平台用户编号。
     pub id: String,
+    /// 编号的种类（v14，可选），如飞书的 `open_id`、`app_id`：宿主照样记进本机的身份里，不写时记成 `ext`。
+    /// 顶替内置平台的插件要写成与内置时代相同，本机旧记录里的人与新消息才认得出是同一个。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_type: Option<String>,
     /// 显示名。
     pub name: String,
     /// 头像键（交给 `avatars/read`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar: Option<String>,
-    /// 租户编号；没有不推断。
+    /// 账号所在的工作区 / 租户的名字（v12 起宿主显示在账号行：“账号 · 工作区”）；没有不推断、不写编号。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
 }
@@ -74,6 +78,10 @@ pub enum PersonKind {
 pub struct Person {
     /// 平台用户编号。
     pub id: String,
+    /// 编号的种类（v14，可选），如飞书的 `open_id`、`app_id`：宿主照样记进本机的身份里，不写时记成 `ext`。
+    /// 顶替内置平台的插件要写成与内置时代相同，本机旧记录里的人与新消息才认得出是同一个。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_type: Option<String>,
     /// 种类。
     pub kind: PersonKind,
     /// 名字；读不到为空。
@@ -91,6 +99,10 @@ pub struct Sender {
     /// 平台身份编号；系统通知可以为空。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
+    /// 编号的种类（v14，可选），如飞书的 `open_id`、`app_id`：宿主照样记进本机的身份里，不写时记成 `ext`。
+    /// 顶替内置平台的插件要写成与内置时代相同，本机旧记录里的人与新消息才认得出是同一个。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_type: Option<String>,
     /// 身份种类。
     pub kind: SenderKind,
     /// 名字。
@@ -193,6 +205,13 @@ pub enum Block {
         /// 被提及用户编号；提及所有人时为空。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_id: Option<String>,
+        /// 编号的种类（v14，可选），如飞书的 `open_id`、`app_id`：宿主照样记进本机的身份里，不写时记成 `ext`。
+        /// 顶替内置平台的插件要写成与内置时代相同，本机旧记录里的人与新消息才认得出是同一个。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id_type: Option<String>,
+        /// 被提及的是人还是机器人（v14，可选）；不写按人。宿主照它显示名字：机器人先用这里的名字，人先用人名册的。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<PersonKind>,
         /// 名字。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
@@ -270,6 +289,32 @@ pub struct ThreadInfo {
     /// 根消息上的话题现状。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<ThreadActivity>,
+    /// 这条是“话题回复与它在会话里的那份”中的哪一边、另一边是哪条（契约 provider-protocol v12 缺口 13）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy: Option<ThreadCopy>,
+}
+
+/// 话题回复与它在会话消息流里那份副本的配对（飞书客户端“同时发送到群”的两条）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadCopy {
+    /// 这一条是哪一边。
+    pub role: ThreadCopyRole,
+    /// 另一边那条的消息编号。
+    pub peer_id: String,
+    /// 平台的话题编号（会话里那条带着，用来找话题第一条）；不知道时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+/// [`ThreadCopy`] 的哪一边。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadCopyRole {
+    /// 会话消息流里的那条。
+    Conversation,
+    /// 话题里的那条（原本的回复）。
+    Thread,
 }
 
 /// 去凭据化的原始数据（声明 `retranslate` 能力时随消息带）。
@@ -339,6 +384,10 @@ pub struct Message {
     /// 去凭据化的原始数据（声明 retranslate 时给）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<Raw>,
+    /// 本人能编辑这条时，编辑框里的原文（表情、链接按平台的写法，契约 provider-protocol v12 缺口 12）；不能编辑就不带。
+    /// 只对声明了 `actions.edit.perMessage` 的插件有意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_draft: Option<Vec<Outgoing>>,
 }
 
 /// 要发出的一段内容（protocol-v1 §7.8）。
@@ -447,6 +496,32 @@ pub struct Emoji {
     /// 别名。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<String>,
+    /// 肤色版本的肤色名字（如“深色”；v14）；不是肤色版本时不写。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<String>,
+    /// 肤色版本：它是哪个表情的哪种肤色（v14）；面板按它把肤色版本收到原表情下面。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone_of: Option<ToneOf>,
+}
+
+/// 肤色版本对应的原表情与肤色。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToneOf {
+    /// 原表情的类型。
+    pub base: String,
+    /// 肤色编号（目录 `tones` 里的）。
+    pub tone: String,
+}
+
+/// 表情目录里的一种肤色。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmojiTone {
+    /// 编号。
+    pub id: String,
+    /// 名字。
+    pub name: String,
 }
 
 pub(crate) fn yes() -> bool {
@@ -527,6 +602,32 @@ pub enum Event {
 
 #[cfg(test)]
 mod tests {
+
+    // 契约 provider-protocol v14：账号与提及可带编号种类，提及还可带人还是机器人；不写时写回不多出键。
+    #[test]
+    fn v14_identities_carry_an_optional_id_type_and_mentions_a_kind() {
+        let mention = serde_json::json!({ "type": "mention", "userId": "cli_1", "idType": "app_id", "kind": "bot", "name": "日报机器人" });
+        let block: Block = serde_json::from_value(mention.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&block).unwrap(), mention);
+        let old = serde_json::json!({ "type": "mention", "userId": "ou_1", "name": "小李" });
+        let block: Block = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            block,
+            Block::Mention {
+                id_type: None,
+                kind: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(&block).unwrap(),
+            old,
+            "旧形状写回不多出键"
+        );
+        let account = serde_json::json!({ "id": "ou_1", "idType": "open_id", "name": "我", "tenant": "示例团队" });
+        let parsed: Account = serde_json::from_value(account.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), account);
+    }
     use super::*;
 
     #[test]
@@ -548,6 +649,7 @@ mod tests {
             conversation_id: "c1".into(),
             sender: Sender {
                 id: "u1".into(),
+                id_type: None,
                 kind: SenderKind::User,
                 name: None,
             },
@@ -561,6 +663,7 @@ mod tests {
             thread: None,
             reactions: None,
             raw: None,
+            edit_draft: None,
         };
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["id"], "m1");
@@ -578,6 +681,7 @@ mod tests {
                 conversation_id: "c".into(),
                 sender: Sender {
                     id: "me".into(),
+                    id_type: None,
                     kind: SenderKind::User,
                     name: None,
                 },
@@ -591,6 +695,7 @@ mod tests {
                 thread: None,
                 reactions: None,
                 raw: None,
+                edit_draft: None,
             }),
         };
         assert_eq!(serde_json::to_value(&acc).unwrap()["state"], "accepted");

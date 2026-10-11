@@ -44,7 +44,40 @@ pub struct Manifest {
     /// 需要的最低宿主（HHH）版本，`主.次.修订`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_host: Option<String>,
+    /// 标志的画法（契约 provider-protocol v12 缺口 10）：`mark` 是透明底的标志图形、宿主垫自己的底；`icon`（默认）是
+    /// 自带底色的完整应用图标、原样铺满。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo_style: Option<LogoStyle>,
+    /// `mark` 画法时图形在画布里的外框（SVG 的 viewBox 坐标），宿主据此核对标志的视觉尺寸；不写按整张画布。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo_ink: Option<LogoInk>,
 }
+
+/// 标志的画法（清单 `logoStyle`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LogoStyle {
+    /// 透明底的标志图形：宿主垫上自己的底。
+    Mark,
+    /// 自带底色的完整应用图标：原样铺满标志位。
+    Icon,
+}
+
+/// 标志图形在自己画布里的外框（viewBox 坐标）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LogoInk {
+    /// 左上角横坐标。
+    pub x: f64,
+    /// 左上角纵坐标。
+    pub y: f64,
+    /// 宽。
+    pub width: f64,
+    /// 高。
+    pub height: f64,
+}
+
+// 外框只用来核对，合法的外框不会是 NaN（`Manifest::logo_ok` 拒绝非有限值）。
+impl Eq for LogoInk {}
 
 impl Manifest {
     /// 本轮新加的发布字段是否合规（契约 provider-protocol v10 §4.2）：目标认得出、来源写法对、最低宿主版本是三段数字、
@@ -107,11 +140,6 @@ impl Manifest {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
     }
 
-    /// 内部平台编号 `ext-<id>`，不会和内置平台或已下线平台撞名。
-    pub fn platform_id(&self) -> String {
-        format!("ext-{}", self.id)
-    }
-
     /// 清单里的 IM 类型是否合规：没写，或写法同编号（[`Self::id_ok`]）。
     ///
     /// # Examples
@@ -126,6 +154,29 @@ impl Manifest {
     /// ```
     pub fn im_type_ok(&self) -> bool {
         self.im_type.as_deref().is_none_or(Self::id_ok)
+    }
+
+    /// 标志的外框是否合规：没写，或四个数都是有限数、宽高大于 0（契约 provider-protocol v12 缺口 10）。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut manifest: hhh_im_protocol::Manifest = serde_json::from_str(
+    ///     r#"{"manifestVersion":1,"id":"sample","name":"示例","version":"0.1.0","command":"p","os":["windows"],
+    ///        "logoStyle":"mark","logoInk":{"x":2,"y":2,"width":20,"height":20}}"#,
+    /// ).unwrap();
+    /// assert!(manifest.logo_ok());
+    /// manifest.logo_ink = Some(hhh_im_protocol::platform::LogoInk { x: 0.0, y: 0.0, width: 0.0, height: 4.0 });
+    /// assert!(!manifest.logo_ok());
+    /// ```
+    pub fn logo_ok(&self) -> bool {
+        self.logo_ink.is_none_or(|ink| {
+            [ink.x, ink.y, ink.width, ink.height]
+                .iter()
+                .all(|v| v.is_finite())
+                && ink.width > 0.0
+                && ink.height > 0.0
+        })
     }
 }
 
@@ -186,7 +237,7 @@ pub struct ConversationNouns {
 }
 
 /// 读取间隔默认值（秒）；字段同 hhh-im `ReadIntervals`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadIntervalsSecs {
     /// 正在看。
@@ -205,6 +256,72 @@ pub struct ReadIntervalsSecs {
     pub people: u64,
     /// 话题跟踪天数。
     pub thread_days: u32,
+    /// 会话发现间隔（契约 provider-protocol v12 缺口 1）；声明了 `discovery` 才有用，不写按宿主默认。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discover: Option<u64>,
+}
+
+/// 会话发现（契约 provider-protocol v12 缺口 1）：插件能列出一段时间里有人发过消息的会话（`conversations/recentActivity`）时给。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryDesc {
+    /// 会话发现间隔最快可设多少秒（由平台这个查询的限额决定）。
+    pub fastest_secs: u64,
+    /// 平时一次检查最多翻几页。
+    pub pages: u16,
+    /// 冷启动（补最近 1 天）一次最多翻几页。
+    pub cold_pages: u16,
+}
+
+/// 开放给用户在「参数配置 → 读取与下载」里改的一项（契约 provider-protocol v12 缺口 2、11）。
+/// 叫法、单位、控件由宿主统一；宿主不认识的取值读成 [`Adjustable::Unknown`]、不画。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Adjustable {
+    /// 读取频率各档、资料与人名、话题天数、会话发现间隔一组。
+    ReadIntervals,
+    /// 按会话读一页最多几条。
+    PageMax,
+    /// 每秒最多读几次。
+    ReadsPerSecond,
+    /// 每分钟最多读几次。
+    ReadsPerMinute,
+    /// 每秒最多下载几次。
+    DownloadsPerSecond,
+    /// 每分钟最多下载几次。
+    DownloadsPerMinute,
+    /// 文件按多大一段下载。
+    FileSegmentBytes,
+    /// 宿主不认识的取值（新宿主才有的项）：忽略。
+    #[serde(other)]
+    Unknown,
+}
+
+/// 组成消息的一种内容块（`editsByContent` 用，契约 provider-protocol v12 缺口 3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ContentKind {
+    /// 文字块。
+    Text,
+    /// 提及块。
+    Mention,
+    /// 格式正文块。
+    Rich,
+    /// 宿主不认识的取值：忽略。
+    #[serde(other)]
+    Unknown,
+}
+
+/// 一条重译规则（契约 provider-protocol v12 缺口 4）：插件换了翻译规则时列一个新名字，宿主按名字把存着原始数据的旧消息
+/// 交给 `messages/retranslate` 一次。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetranslateRule {
+    /// 规则名（插件自己定，同一个插件里不重复）。
+    pub name: String,
+    /// 只把 `raw.format` 在其中的旧消息交给它；空 = 全部存着原始数据的。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<String>,
 }
 
 /// 同时发送到会话的能力。
@@ -248,7 +365,22 @@ pub struct ActionRules {
     pub recall: Option<OwnWithin>,
     /// 能编辑；null 表示不能。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub edit: Option<OwnWithin>,
+    pub edit: Option<EditRule>,
+}
+
+/// 编辑的规则：同 [`OwnWithin`]，另可声明每条消息自己说能不能编辑（契约 provider-protocol v12 缺口 12）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EditRule {
+    /// 只能对本人发的消息做。
+    #[serde(default)]
+    pub own: bool,
+    /// 平台时限（秒）；没有时限为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within_secs: Option<u64>,
+    /// 为真时只有带 `editDraft` 的消息能编辑，编辑框用它；为假时宿主按通用规则（文字与提及）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub per_message: bool,
 }
 
 /// “只对本人发的、在时限内”这类操作约束。
@@ -272,6 +404,13 @@ pub struct UnlistedEmoji {
     pub placeholder_pattern: Option<String>,
     /// 占位图标的叫法。
     pub placeholder_label: String,
+    /// 目录外的表情类型也能问 `emoji/image` 要图：插件按自己的规律猜，猜不到回 `notFound`（契约 provider-protocol v12 缺口 8）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guess: bool,
+    /// 声明了 `guess` 时只拿这些类型去问（正则，JavaScript 语法；v14）：猜不出的（如飞书企业表情的纯数字编号）
+    /// 不必每次都问一遍。不写时目录外的都问。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guess_pattern: Option<String>,
 }
 
 /// 表情规则（有表情能力时给）。
@@ -283,6 +422,25 @@ pub struct EmojiRules {
     pub name_pattern: Option<String>,
     /// 目录外的表情怎么显示。
     pub unlisted: UnlistedEmoji,
+    /// 正文里表情的写法（JavaScript 正则，第一个括号是表情名，如 `\[([^\[\]\r\n]{1,12})\]`）：宿主把正文里这样写的换成表情图；
+    /// 不写就不换（契约 provider-protocol v12 缺口 9）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_pattern: Option<String>,
+    /// 表情图是白底的：宿主显示前抠成透明（深色主题下不露白底）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub white_background: bool,
+}
+
+/// 头像键里的身份（v14，可选）：同一个头像每次给的键不一样（如换了 CDN 主机）时，宿主靠它认出没变——资料不算变了、
+/// 头像不重下。两个写法都是 Rust `regex-lite` 的正则（不支持环视与反向引用）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvatarIdentity {
+    /// 第一个括号是头像编号；对不上时整个键就是身份。
+    pub key_pattern: String,
+    /// 第一个括号是尺寸这类变体（同一个头像的不同尺寸各下一份）；不写或对不上时没有变体。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_pattern: Option<String>,
 }
 
 /// 平台说明（protocol-v1 §5.1）：宿主据此限速、分页、显示界面、算每条消息能做什么。
@@ -291,6 +449,9 @@ pub struct EmojiRules {
 pub struct PlatformDesc {
     /// 头像形状（必填）。
     pub avatar_shape: AvatarShape,
+    /// 头像键里的身份（v14）；不写时整个键就是身份。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_identity: Option<AvatarIdentity>,
     /// 历史能力（必填）。
     pub history: HistoryMode,
     /// 每条消息允许的操作（必填）。
@@ -304,10 +465,10 @@ pub struct PlatformDesc {
     /// 各类会话的叫法。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_nouns: Option<ConversationNouns>,
-    /// 按会话读一页最多几条（history=server 必填）。
+    /// 按会话读一页最多几条（正整数，不写按宿主默认 50）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub page_max: Option<u16>,
-    /// 读取请求合计上限（history=server 必填）。
+    pub page_max: Option<u32>,
+    /// 读取请求合计上限（不写按宿主默认每秒 5、每分钟 120）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reads: Option<RateBudget>,
     /// 下载资源的上限；平台不限为空。
@@ -337,6 +498,18 @@ pub struct PlatformDesc {
     /// 表情规则（有表情能力时给）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emoji: Option<EmojiRules>,
+    /// 会话发现（声明了 `conversations.recentActivity` 时给）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoveryDesc>,
+    /// 开放给用户改的读取与下载项；不写就一项都不开放。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_adjustable: Vec<Adjustable>,
+    /// 哪几种内容块组成的消息，平台改过时只有内容变了、不标编辑时间：宿主见过旧内容、更新时间往后走、内容真变了才记编辑过。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits_by_content: Vec<ContentKind>,
+    /// 当前的重译规则，按顺序（声明了 `retranslate` 能力时有用）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retranslate_rules: Vec<RetranslateRule>,
 }
 
 /// 一组能力开关（protocol-v1 §5.2）。没写出来的都算不支持。
@@ -373,6 +546,9 @@ pub struct Capabilities {
     /// 支持原始数据与重新翻译。
     #[serde(default)]
     pub retranslate: bool,
+    /// 会话（账号）能力。
+    #[serde(default, skip_serializing_if = "SessionCaps::is_empty")]
+    pub session: SessionCaps,
 }
 
 /// 会话能力。
@@ -391,6 +567,24 @@ pub struct ConversationCaps {
     /// 能定位已有私聊。
     #[serde(default)]
     pub find_direct: bool,
+    /// 能列出一段时间里有人发过消息的会话（会话发现，契约 provider-protocol v12 缺口 1）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recent_activity: bool,
+}
+
+/// 会话（账号）能力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCaps {
+    /// 能用存着的凭据续期（`session/renew`，契约 provider-protocol v12 缺口 7）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub renew: bool,
+}
+
+impl SessionCaps {
+    fn is_empty(&self) -> bool {
+        !self.renew
+    }
 }
 
 /// 消息读取能力。
@@ -632,6 +826,40 @@ impl Capabilities {
 
 #[cfg(test)]
 mod tests {
+
+    // 契约 provider-protocol v14：头像身份、猜图范围都可选；不写时读成空、写回不多出键，写了原样往返。
+    #[test]
+    fn v14_platform_declarations_are_optional_and_round_trip() {
+        use serde_json::json;
+        let actions =
+            json!({ "reply": true, "thread": false, "react": false, "edit": { "own": true } });
+        let old: PlatformDesc = serde_json::from_value(
+            json!({ "avatarShape": "circle", "history": "server", "actions": actions }),
+        )
+        .unwrap();
+        assert!(old.avatar_identity.is_none());
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("avatarIdentity")
+                .is_none()
+        );
+        let new = json!({
+            "avatarShape": "circle", "history": "server", "actions": actions,
+            "avatarIdentity": { "keyPattern": "/(v3_[^/?#]+)", "variantPattern": "[?&]image_size=([^&#]+)" },
+            "emoji": { "unlisted": { "placeholderLabel": "企业表情", "guess": true, "guessPattern": "^[A-Za-z_]+$" } }
+        });
+        let desc: PlatformDesc = serde_json::from_value(new.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&desc).unwrap(), new, "新声明原样往返");
+        let identity = desc.avatar_identity.unwrap();
+        assert_eq!(
+            (
+                identity.key_pattern.as_str(),
+                identity.variant_pattern.as_deref()
+            ),
+            ("/(v3_[^/?#]+)", Some("[?&]image_size=([^&#]+)"))
+        );
+    }
     use super::*;
 
     #[test]
@@ -701,6 +929,7 @@ mod tests {
     fn platform_desc_omits_empty_optionals_but_keeps_required() {
         let d = PlatformDesc {
             avatar_shape: AvatarShape::Rounded,
+            avatar_identity: None,
             history: HistoryMode::None,
             actions: ActionRules {
                 recall: Some(OwnWithin {
@@ -723,6 +952,10 @@ mod tests {
             reactions_in_reads: false,
             emoji_per_account: false,
             emoji: None,
+            discovery: None,
+            user_adjustable: Vec::new(),
+            edits_by_content: Vec::new(),
+            retranslate_rules: Vec::new(),
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["avatarShape"], "rounded");
@@ -730,5 +963,110 @@ mod tests {
         assert_eq!(v["actions"]["recall"]["withinSecs"], 120);
         assert!(v.get("chatLink").is_none());
         assert!(v.get("deletedMessagesVanish").is_none(), "false 不序列化");
+        for key in [
+            "discovery",
+            "userAdjustable",
+            "editsByContent",
+            "retranslateRules",
+        ] {
+            assert!(v.get(key).is_none(), "没声明的 {key} 不写");
+        }
+    }
+
+    // 契约 provider-protocol v12：平台说明的新声明都是可选的——旧插件的形状照读、写回不多出键；新声明原样往返；
+    // 宿主不认识的可调项、内容块种类读成 Unknown、不让整个握手失败。
+    #[test]
+    fn v12_platform_declarations_are_optional_and_round_trip() {
+        use serde_json::json;
+        let old = json!({
+            "avatarShape": "circle", "history": "server", "actions": { "reply": true, "thread": false, "react": false,
+              "edit": { "own": true } },
+            "pageMax": 50, "reads": { "perSecond": 5, "perMinute": 120 },
+            "emoji": { "unlisted": { "placeholderLabel": "表情" } }
+        });
+        let desc: PlatformDesc = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&desc).unwrap(),
+            old,
+            "旧形状写回不多出键"
+        );
+        assert!(desc.user_adjustable.is_empty() && desc.discovery.is_none());
+
+        let new = json!({
+            "avatarShape": "rounded", "history": "server",
+            "actions": { "reply": false, "thread": false, "react": false,
+              "edit": { "own": true, "withinSecs": 86400, "perMessage": true } },
+            "pageMax": 200000,
+            "readDefaults": { "watching": 2, "active": 5, "quiet": 60, "dormant": 300, "stale": 600, "profile": 600,
+              "people": 600, "threadDays": 7, "discover": 45 },
+            "emoji": { "unlisted": { "placeholderLabel": "表情", "guess": true },
+              "textPattern": "\\[([^\\[\\]\\r\\n]{1,12})\\]", "whiteBackground": true },
+            "discovery": { "fastestSecs": 15, "pages": 3, "coldPages": 10 },
+            "userAdjustable": ["readIntervals", "readsPerMinute", "fileSegmentBytes"],
+            "editsByContent": ["text", "mention", "rich"],
+            "retranslateRules": [{ "name": "sample-card-v1" }, { "name": "sample-card-v2", "formats": ["sample-msg-v1"] }]
+        });
+        let desc: PlatformDesc = serde_json::from_value(new.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&desc).unwrap(), new, "新声明原样往返");
+        assert_eq!(desc.page_max, Some(200_000), "每页条数不设协议上限");
+        assert!(desc.actions.edit.unwrap().per_message);
+        assert_eq!(desc.read_defaults.unwrap().discover, Some(45));
+
+        let future: PlatformDesc = serde_json::from_value(json!({
+            "avatarShape": "circle", "history": "none", "actions": {},
+            "userAdjustable": ["readIntervals", "somethingNew"], "editsByContent": ["card"]
+        }))
+        .unwrap();
+        assert_eq!(
+            future.user_adjustable,
+            [Adjustable::ReadIntervals, Adjustable::Unknown]
+        );
+        assert_eq!(future.edits_by_content, [ContentKind::Unknown]);
+    }
+
+    #[test]
+    fn v12_capabilities_and_manifest_fields_are_optional() {
+        use serde_json::json;
+        let caps: Capabilities =
+            serde_json::from_value(json!({ "conversations": { "list": true } })).unwrap();
+        assert!(!caps.conversations.recent_activity && !caps.session.renew);
+        let v = serde_json::to_value(&caps).unwrap();
+        assert!(v.get("session").is_none(), "没声明续期时不写 session");
+        assert!(v["conversations"].get("recentActivity").is_none());
+
+        let caps: Capabilities = serde_json::from_value(
+            json!({ "conversations": { "recentActivity": true }, "session": { "renew": true } }),
+        )
+        .unwrap();
+        assert!(caps.conversations.recent_activity && caps.session.renew);
+
+        let manifest: Manifest = serde_json::from_value(json!({
+            "manifestVersion": 1, "id": "sample", "name": "示例", "version": "0.1.0", "command": "p", "os": ["windows"]
+        }))
+        .unwrap();
+        assert!(manifest.logo_style.is_none() && manifest.logo_ok());
+        assert!(
+            serde_json::to_value(&manifest)
+                .unwrap()
+                .get("logoStyle")
+                .is_none()
+        );
+        let marked: Manifest = serde_json::from_value(json!({
+            "manifestVersion": 1, "id": "sample", "name": "示例", "version": "0.1.0", "command": "p", "os": ["windows"],
+            "logoStyle": "mark", "logoInk": { "x": 1.5, "y": 2, "width": 21, "height": 20 }
+        }))
+        .unwrap();
+        assert_eq!(marked.logo_style, Some(LogoStyle::Mark));
+        assert!(marked.logo_ok());
+        let bad = Manifest {
+            logo_ink: Some(LogoInk {
+                x: f64::NAN,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }),
+            ..marked
+        };
+        assert!(!bad.logo_ok());
     }
 }

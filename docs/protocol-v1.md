@@ -44,12 +44,14 @@
 | 字段 | 规则 |
 |---|---|
 | `manifestVersion` | 清单格式的版本，现在是 1 |
-| `id` | 程序编号：以小写字母开头，只含 `a-z0-9-`，长 2–32 个字符。宿主内部使用的平台编号是 `ext-<id>`，因此永远不会和内置平台（`feishu`、`slack`）或已下线的平台（`wechat`）撞名。同一个编号只能装一个程序 |
+| `id` | 程序编号：以小写字母开头，只含 `a-z0-9-`，长 2–32 个字符。宿主内部使用的平台编号由宿主定（一般是 `ext-<id>`），因此永远不会和内置平台（`feishu`、`slack`）或已下线的平台（`wechat`）撞名；程序不用知道这个编号（v14 起回调路径写相对路径，见 §6.1a）。同一个编号只能装一个程序。例外（v12）：带官方签名、编号是保留编号（与某个内置平台同名）的程序，平台编号就是这个编号，装上后顶替同编号的内置平台（附录 D） |
 | `name` | 给用户看的平台名，1–20 个字符 |
 | `version` | 程序版本，semver 写法 |
 | `command` / `args` | 启动命令。`command` 按清单所在目录解析相对路径，也可以是 PATH 里能找到的程序（如 `node`、`python`）；`args` 原样传入 |
 | `os` | 支持的系统：`windows` / `macos` / `linux`。当前系统不在列表里时不能添加 |
 | `logo` | 可选。SVG、PNG、JPG 或 WebP，不超过 256 KiB，路径相对清单所在的文件夹、不能走出这个文件夹。没有 logo 时，宿主用名字的第一个字画一个 |
+| `logoStyle` | 可选（v12）。`icon`（默认）：logo 是一张完整的应用图标，宿主原样画；`mark`：logo 是透明底的标志图形，宿主垫自己的底色与外框（同内置飞书、Slack） |
+| `logoInk` | 可选（v12）。`{x, y, width, height}`：标志图形在画布里实际占的那一块（按 logo 自己的坐标），宿主据此居中、缩放。四个数要是有限数，宽、高大于 0 |
 | `publisher` / `homepage` | 可选。添加时展示给用户 |
 | `imType` | 可选（v5）。IM 类型，规则同 `id`。内置飞书是 `feishu`、内置 Slack 是 `slack`；写成同一个值就和它们是同一种，宿主里同一种同一时间只用一个。不写时自成一类、不和任何 IM 互斥。只认这个字段，插件编号碰巧同名不算同一种 |
 | `source` | 可选（v10）。更新来源：`{"type":"github","repo":"<owner>/<name>"}`、`{"type":"gitlab","host":"https://<站点>","project":"<group>/<name>"}`、`{"type":"url","index":"https://…/hhhim-release.json"}` 之一。不写就没有更新来源。写了时 `version` 必须是 `主.次.修订` 三段数字。宿主只接受同一来源、同一编号的更新 |
@@ -100,7 +102,8 @@
   "provider": { "id": "wechat-pad", "name": "微信", "version": "0.3.0" },
   "platform": { "…": "平台说明，见 §5.1" },
   "capabilities": { "…": "能力，见 §5.2" },
-  "settings": [ "…程序设置项，见 §6.4" ]
+  "settings": [ "…程序设置项，见 §6.4" ],
+  "loginMethods": [ "…可选，登录方式，见 §6.1a" ]
 }
 ```
 
@@ -117,13 +120,19 @@
 参数：
 
 ```json
-{ "credential": "<不透明字符串，或 null>", "settings": { "<键>": "<值>" }, "syncState": "<不透明字符串，或 null>" }
+{ "credential": "<不透明字符串，或 null>", "settings": { "<键>": "<值>" }, "syncState": "<不透明字符串，或 null>",
+  "credentialReadOnly": true, "legacy": { "format": "hhh-builtin-v1", "credential": "…", "settings": {} } }
 ```
+
+- `credentialReadOnly`（可选，v12）：这份凭据是借来的、只能用（例如隔离测试环境借用户本人的）。为真时程序不得换新凭据、不得调 `credential/save`（宿主一律回错误），到期就发 `session/expired`。不带即为假。
+- `legacy`（可选，v12）：同编号的内置平台留下的授权与设置，只在程序还没有自己的凭据时交一次，格式见附录 D。
 
 结果是下面两种之一：
 
-- `{ "state": "online", "account": Account }`
+- `{ "state": "online", "account": Account, "adoptedSettings"?: { "parameters"?: { "<设置项编号>": "<值>" }, "login"?: { "method", "values" } } }`
 - `{ "state": "needsLogin", "reason": "noCredential|expired|revoked|credentialInvalid", "message": "<给用户看的说明>" }`
+
+`adoptedSettings`（可选，v12）：接过 `legacy` 时，请宿主写进这个程序设置项（§6.4）的值与“现在在用”的登录方式（§6.1a）。宿主只在程序在线、并且回 `online` 时已经用 `credential/save` 存好自己的凭据，才删掉内置平台那份授权并写入这些设置；否则内置那份不动，程序还没有自己的凭据时下次打开再交。
 
 规则：
 
@@ -149,22 +158,27 @@
 | 字段 | 类型 | 必需 | 说明 |
 |---|---|---|---|
 | `avatarShape` | `circle` \| `rounded` | 是 | 头像在平台自己的客户端里是什么形状 |
+| `avatarIdentity` | 对象 | 否 | v14。`{keyPattern, variantPattern?}`：头像键里的身份。平台给同一个头像的地址会变（如换了 CDN 主机）、程序又拿地址当键时写它：`keyPattern` 的第一个括号是头像编号（对不上时整个键就是身份），`variantPattern` 的第一个括号是尺寸这类变体（不写或对不上时没有变体）。身份相同宿主就当没变：资料不算变了、头像不重下。两个都是 Rust `regex-lite` 的正则（不支持环视与反向引用） |
 | `chatLink` | 字符串 | 否 | 在平台客户端里打开会话的链接模板，`{conversation}` 会换成 URL 编码后的会话编号。不给就不显示“在 xx 里查看” |
 | `imageNamePrefix` | 字符串 | 否 | 用户下载图片时文件名的开头，默认用平台名 |
 | `conversationNouns` | `{group, direct, channel, unknown}` | 否 | 各类会话怎么称呼，默认依次是“群 / 私聊 / 频道 / 会话” |
 | `history` | `server` \| `none` | 是 | `server`：消息随时可以向平台重新读取（飞书、Slack 这类）。`none`：平台只推一次，不能翻历史（微信这类）。见 §11.4 |
-| `pageMax` | 整数 1–100 | `history=server` 时必需 | 按会话读消息时，一页最多几条 |
-| `reads` | `{perSecond, perMinute}` | `history=server` 时必需 | 读取请求的合计上限。宿主在它和自己的上限（每秒 20 次、每分钟 1200 次）里取更严的 |
+| `pageMax` | 正整数 | `history=server` 时必需 | 按会话读消息时，一页最多几条。协议不设上限（v12），按平台自己的上限写 |
+| `reads` | `{perSecond, perMinute}` | 否 | 读取请求的合计上限。不写按宿主默认（每秒 5 次、每分钟 120 次，v12 起不再必填） |
 | `downloads` | `{perSecond, perMinute}` | 否 | 下载消息资源的上限，平台不限就省略 |
-| `fileSegmentBytes` | 整数，64 KiB–8 MiB | 否 | 文件按多大一段读，支持续传。不给就整份读，断了从头重下 |
+| `fileSegmentBytes` | 正整数 | 否 | 文件按多大一段读，支持续传。不给就整份读，断了从头重下。协议不设上下限（v12） |
 | `limits` | `{imageUploadMaxBytes, fileUploadMaxBytes, attachmentNameMaxBytes}` | 能发图片或文件时必需 | 发送附件的上限 |
-| `readDefaults` | 读取间隔（秒） | 否 | 默认读取间隔，字段同 hhh-im 的 `ReadIntervals`。超出宿主允许范围的值会被拒绝 |
+| `readDefaults` | 读取间隔（秒） | 否 | 默认读取间隔，字段同 hhh-im 的 `ReadIntervals`，另可写 `discover`（会话发现间隔，v12）。超出宿主允许范围的值会被拒绝 |
+| `userAdjustable` | 字符串数组 | 否 | v12。开放给用户在「参数配置 → 读取与下载」里改的项：`readIntervals`（读取频率一组）、`pageMax`、`readsPerSecond`、`readsPerMinute`、`downloadsPerSecond`、`downloadsPerMinute`、`fileSegmentBytes`。叫法、单位、控件由宿主统一，默认值取本平台说明里写的；改了立即生效。不认识的取值宿主忽略。一项都不写就没有这一组 |
+| `discovery` | `{fastestSecs, pages, coldPages}` | 否 | v12。会话发现：宿主定时问程序一段时间里有人发过消息的会话（`conversations/recentActivity`，§8），把不在列表里的加进会话列表。`fastestSecs` 是最快多久问一次，`pages` / `coldPages` 是平常与刚启动时一次最多翻几页。要同时声明能力 `conversations.recentActivity` 才生效 |
+| `editsByContent` | 字符串数组 | 否 | v12。平台不给“改过”标记时，宿主按内容认编辑：这里列出的内容块种类（`text`、`mention`、`rich`）真变了、时间往后才算编辑过。不写就只认 `editedAtMs` |
+| `retranslateRules` | `[{name, formats?}]` | 否 | v12。程序现在的翻译规则名，按顺序（§10.1）。`formats` 给了就只把 `raw.format` 在其中的旧消息交给这条规则。至多 32 条，名字不能重复 |
 | `threads` | 对象或 null | 否 | 平台有话题时给：`{activityOnRoot, readsAfter, broadcast: {native, attachments} 或 null}`，含义同 hhh-im `Platform` 里的同名项 |
 | `deletedMessagesVanish` | 布尔 | 否 | 撤回的消息直接从历史里消失（而不是留下“已撤回”标记）时为真。默认假 |
 | `reactionsInReads` | 布尔 | 否 | 读消息时会随消息带回完整的表情。默认假 |
 | `emojiPerAccount` | 布尔 | 否 | 不同账号的表情目录不一样。默认假 |
 | `actions` | 见下文 | 是 | 每条消息允许哪些操作 |
-| `emoji` | `{namePattern, unlisted: {placeholderPattern, placeholderLabel}}` | 有表情能力时必需 | 表情编号的规则（正则，JavaScript 语法），以及目录里没有的表情怎么显示 |
+| `emoji` | `{namePattern, unlisted: {placeholderPattern, placeholderLabel, guess?, guessPattern?}, textPattern?, whiteBackground?}` | 有表情能力时必需 | 表情编号的规则（正则，JavaScript 语法；v14 起宿主照它核对点表情的编号），以及目录里没有的表情怎么显示（v14 起宿主照 `placeholderPattern`、`placeholderLabel` 画占位）。v12：`unlisted.guess` 为真时，目录外的表情类型也问 `emoji/image` 要图（§9.1），v14：`guessPattern` 给了就只拿合它的类型去问（猜不出的如飞书企业表情的纯数字编号不必每次问）；`textPattern` 是正文里表情的写法（JavaScript 正则，第一个括号是表情名，例如飞书的 `\[([^\[\]\r\n]{1,12})\]`），宿主把正文里这样写、目录里有这个名字的换成表情图，不写就不换；`whiteBackground` 为真时表情图是白底的，宿主显示前抠成透明 |
 
 `actions` 用声明式规则写，由宿主用通用代码执行。内置平台的这部分是 Rust 函数（`actions` / `edit_draft`），外部程序改用下面这种规则：
 
@@ -181,11 +195,10 @@
 - `recall` 或 `edit` 为 null，表示不能做。`own: true` 表示只能对本人发的消息做。`withinSecs` 是平台的时限：过了时限宿主就不再显示这个操作，但最终能不能做，仍以平台的答复为准。
 - 已撤回的消息和系统通知，一律没有任何操作。
 - “编辑”只对内容是文字和提及的消息显示。编辑框里的原文由宿主按通用规则从消息里拼出来，文字和提及分开成几段。
+- v12：`edit` 加 `perMessage: true` 时，每条消息自己说能不能编辑——本人能编辑的那条带 `editDraft`（§7.4，编辑框里的原文，表情、链接按平台的写法），不带就不显示“编辑”。
 
-内置平台的平台说明里还有几项，外部程序的平台说明**刻意不设**。原因如下，以免以后误加：
+外部程序的平台说明**刻意不设**的几项（以免以后误加）：
 
-- **不猜表情图，也不补全表情目录**：表情目录由程序在 `emoji/catalog` 里一次给全。
-- **不靠比较内容推断“编辑过”**：程序必须自己给出 `editedAtMs`。比较内容是飞书独有的特例。
 - **没有头像身份规则**：头像用不透明的键（§7.3），同一个头像的键必须保持不变。
 - **没有页面可以直接加载的图片来源**：所有图片都经宿主的文件库读取。
 
@@ -204,9 +217,12 @@
   "reactions":     { "list": false, "add": false, "remove": false, "catalog": false },
   "resources":     { "read": true, "avatars": true },
   "events":        { "messages": true, "deletions": true, "reactions": false, "conversations": true, "people": true },
-  "retranslate":   true
+  "retranslate":   true,
+  "session":       { "renew": false }
 }
 ```
+
+- v12：`conversations.recentActivity` 为真时程序能回答 `conversations/recentActivity`（会话发现，§8）；`session.renew` 为真时程序能用存着的凭据续期（`session/renew`，§6.6）。
 
 - `retranslate` 为真时，程序随消息附带去凭据化的原始数据（§7.4 的 `raw`），宿主存一张原始数据表；程序翻译规则升级后，宿主调 `messages/retranslate`（§10.1）让它把本地旧消息重新翻译一遍。为假时不附带原始数据、也不会被调用重译。
 
@@ -219,7 +235,7 @@
 
 ### 6.1 登录流程
 
-宿主调用 `login/start`（参数 `{}`），程序返回 `{ "flowId": "<编号>" }`。之后程序发 `login/step` 通知，告诉宿主当前该显示什么，宿主用通用组件显示出来：
+宿主调用 `login/start`，程序返回 `{ "flowId": "<编号>" }`。参数在没声明登录方式时是 `{}`；声明了登录方式（§6.1a）时是 `{ "method", "values", "callbackUrl"?, "state"? }`：这次选的方式、填的内容（`relayUrl`；`appId`、`appSecret`——`appSecret` 只在用户这次填了时给，没填表示沿用程序凭据里的）、宿主收回调的完整地址与一次性 `state`（声明了 `callbackPath` 时给）。旧程序收到多出的字段照常忽略。之后程序发 `login/step` 通知，告诉宿主当前该显示什么，宿主用通用组件显示出来：
 
 | `step.kind` | 字段 | 宿主显示什么 |
 |---|---|---|
@@ -234,8 +250,35 @@
 登录流程以程序发出的两个通知之一结束：`login/finished {flowId, account}` 或 `login/failed {flowId, message, retryable}`。用户中途取消时，宿主发 `login/cancel {flowId}`。
 
 - 同一时间只有一个登录流程。新的 `login/start` 会取消还没结束的旧流程。
-- 需要浏览器授权回调（OAuth）的，回调由程序自己接收：程序在本机回环地址上监听，并把这个地址写进 `openUrl` 步骤里。宿主不为程序开回调路由。
+- 需要浏览器授权回调（OAuth）的，有两种做法：程序自己在本机回环地址上监听，并把这个地址写进 `openUrl` 步骤里；或者（v12）在登录方式里声明 `callbackPath`，由宿主在本机地址上收（§6.1a）。
 - 程序必须在收到 `credential/save` 的成功回复之后，才能发 `login/finished`。
+- `openUrl` 一步到了，宿主自动打开它（桌面版在授权窗口里，网页版新标签），登录框里的次按钮（文字用 `label`）能再打开一次；登录结束后宿主关掉授权窗口（v12）。
+
+### 6.1a 登录方式（v12，可选）
+
+`initialize` 结果里的 `loginMethods` 声明程序支持的登录方式，按显示顺序。不写就是只有一种：点“登录”直接走程序推来的步骤。写了时，点“登录”先到登录框的“选登录方式”一步：两种以上用页签选，打开时停在现在在用的方式、带出已保存的内容；填得不对宿主就地说原因、不开始。
+
+```json
+[{ "id": "relay", "kind": "relay", "label": "通过中继登录", "note": "…", "placeholder": "https://relay.example.com",
+   "defaultValue": "https://relay.example.com" },
+ { "id": "own", "kind": "ownApp", "label": "使用自己的应用", "note": "…", "idLabel": "App ID", "idPlaceholder": "cli_ 开头",
+   "secretLabel": "App Secret", "secretPlaceholder": "…", "secretHelp": "开放平台 → 凭证与基础信息。只保存在本机。",
+   "callbackPath": "callback",
+   "callbackHelp": "在应用后台把这个地址登记为重定向地址。",
+   "createLink": { "label": "前往开放平台创建", "url": "https://…", "after": "，创建后把 App ID 与 App Secret 填在下面。" } }]
+```
+
+| `kind` | 登录前要填 | 宿主核对 |
+|---|---|---|
+| `relay` | 中继地址（`values.relayUrl`） | 必填；https 网址，或本机回环的 http；只填网址本身 |
+| `ownApp` | App ID、App Secret（`values.appId`、`values.appSecret`） | App ID 必填；第一次用或换了 App ID 要填 Secret，不填沿用已保存的 |
+| `direct` | 不用填 | 点“登录”后照程序推来的步骤走 |
+
+- 叫法、说明、灰字、链接文字由程序写，每段至多 200 字；链接只收 https。至多 8 种，`id` 不重复；宿主不认识的 `kind` 不登记那一种。
+- **登录成功才保存**：`login/finished` 且凭据已存好之后，宿主保存这次的方式与填的内容（Secret 进系统凭据库），换了方式就删掉另一种的；失败、取消什么都不动。
+- **预填中继**（v14）：`relay` 可以写 `defaultValue`（https 网址）：没保存过中继地址时框里预填它；不写就空着让用户填。
+- **App Secret 的说明**（v14）：`ownApp` 可以写 `secretHelp`：去哪找、存在哪，画在 Secret 框旁的 ⓘ 里。
+- **本机回调**：`ownApp` 声明了 `callbackPath` 时，写相对路径（v14，如 `callback`）宿主就拼在这个 IM 自己的 `/hhh-friend-im/<平台编号>/` 下面，程序不必知道宿主怎么给它编号；照 v12 写以 `/` 开头的完整路径时，必须已经在这个目录下面（不合要求时宿主不登记这种方式）。宿主在 `http://localhost:<Friend 端口><callbackPath>` 收：只在这个程序正在登录、路径对、`state` 对得上时，用 `login/callback {flowId, url}`（宿主→程序请求，`url` 是带查询串的完整地址）交给程序，页面写“<名字>授权已完成，可以关掉这个页面。登录结果在 Friend 里显示。”；其余一律拒绝。程序核对后照常以 `login/finished` 或 `login/failed` 结束。
 
 ### 6.2 凭据由宿主保存
 
@@ -243,7 +286,7 @@
 
 ### 6.3 credential/save（程序→宿主请求）
 
-参数：`{ "credential": "<不透明字符串，不超过 64 KiB>" }`。宿主把它写进系统凭据库（沿用 Friend 现在的分片保存），写好后回复空结果。写失败时宿主回复错误，这时程序不能丢掉旧凭据。
+参数：`{ "credential": "<不透明字符串，不超过 64 KiB>", "renewAtMs"?: 0 }`。宿主把它写进系统凭据库（沿用 Friend 现在的分片保存），写好后回复空结果。写失败时宿主回复错误，这时程序不能丢掉旧凭据。`renewAtMs`（v12）是下次要续期的时间，见 §6.6。
 
 - 这些时候都要调用：登录成功、续期后换了密钥、平台轮换了会话材料。
 - **先存后用**：要换凭据时，程序先调用 `credential/save`，等宿主回复成功之后，才能丢掉旧凭据。
@@ -280,11 +323,18 @@
 
 ### 6.5 授权失效与断开
 
-- 程序发现授权失效时，发通知 `session/expired {reason, message}`，`reason` 是 `expired`、`revoked`、`credentialInvalid` 之一。在重新登录之前，程序对之后的请求一律回授权失效错误（§12）。宿主据此停止读取，并提示用户重新登录，走 hhh-im 现有的 `AuthExpired` 流程。
+- 程序发现授权失效时，发通知 `session/expired {reason, message}`，`reason` 是 `expired`、`revoked`、`credentialInvalid` 之一。在重新登录之前，程序对之后的请求一律回授权失效错误（§12）。宿主据此停止读取，并提示用户重新登录，走 hhh-im 现有的 `AuthExpired` 流程。宿主保留登录记录与账号名，卡片写“账号 · 登录已失效”，下面一行是 `message`，右边“重新登录”；会话页、添加关注页在“登录已失效”下面也写它（v12）。
+- `session/notice {notices: [{id, text, relogin}]}`（程序→宿主通知，v12）：这个连接现在有的问题（如缺某个权限），**每次给全**，空数组就是都好了。宿主把它们画在卡片下面，每条一行；`relogin` 为真的要重新登录才能好，卡片右边多一颗“重新登录”。至多 20 条，每条至多 200 字。
 - 用户在 HHH 里断开连接时：
   1. 宿主调用 `session/logout`。程序尽量在平台上登出，然后丢掉内存里的会话。
   2. 宿主删除凭据，停止进程。
   3. 本地聊天记录和文件按 HHH 现有规则保留，断开不删数据。
+
+### 6.6 续期（v12，可选）
+
+- 凭据里的会话材料会过期、要定时换新的平台，存凭据时带 `renewAtMs`，并声明能力 `session.renew`。到时宿主叫 `session/renew {credential}`（宿主→程序请求，`credential` 是宿主存着的那份）：程序在跑就直接叫；没在跑时宿主临时起进程、`initialize` 之后不开账号直接叫，续完关掉。程序续完先 `credential/save` 存新的（带下次的 `renewAtMs`），再回空结果；续不了回错误（授权失效回 `authExpired`）。
+- 续期、登录保存与退出登录在宿主里串行：退出登录、卸载之后迟到的 `credential/save` 一律回错误。
+- `session/open.credentialReadOnly` 为真（凭据是借来的）时宿主不排续期。
 
 ## 7. 数据模型
 
@@ -292,7 +342,11 @@
 
 ### 7.1 Account
 
-`{ "id", "name", "avatar"?: AvatarKey, "tenant"? }`
+`{ "id", "idType"?, "name", "avatar"?: AvatarKey, "tenant"? }`
+
+`tenant` 是账号所在的工作区 / 租户的名字（v12 起宿主显示它）：卡片的账号行写“账号 · 工作区”。
+
+**编号种类 `idType`**（v14，可选）：账号、发送者、人员、提及（含格式正文与卡片里的人）都可以带，说这个编号是平台的哪一种（如飞书的 `open_id`、`app_id`，系统通知可以是空串）。宿主照样记进本机的身份里，不写时记成 `ext`。顶替内置平台的程序要写成与内置时代相同，本机旧记录里的人与新消息才认得出是同一个。
 
 ### 7.2 Conversation
 
@@ -302,7 +356,7 @@
 
 ### 7.3 Person 与 AvatarKey
 
-- Person：`{ "id", "kind": "user|bot", "name"?, "avatar"? }`。
+- Person：`{ "id", "idType"?, "kind": "user|bot", "name"?, "avatar"? }`。
 - AvatarKey 是不透明字符串，宿主拿它调用 `avatars/read`。同一个头像的键不能变；头像换了，键也必须跟着换。
 
 ### 7.4 Message
@@ -310,7 +364,7 @@
 ```json
 {
   "id": "…", "conversationId": "…",
-  "sender": { "id": "…", "kind": "user|bot|system", "name": "…" },
+  "sender": { "id": "…", "idType": "…", "kind": "user|bot|system", "name": "…" },
   "createdAtMs": 0, "updatedAtMs": 0, "editedAtMs": 0,
   "deleted": false, "incomplete": false,
   "content": [ "Block…" ],
@@ -318,7 +372,8 @@
   "thread": { "id": "…", "rootId": "…", "inThread": true, "broadcast": false,
               "activity": { "latestReplyId": "…", "latestReplyAtMs": 0, "replyCount": 0 } },
   "reactions": [ "Reaction…" ],
-  "raw": { "format": "<程序自定的格式名>", "data": "<去凭据化的原始数据，字符串或 base64>" }
+  "raw": { "format": "<程序自定的格式名>", "data": "<去凭据化的原始数据，字符串或 base64>" },
+  "editDraft": [ "Outgoing…" ]
 }
 ```
 
@@ -326,7 +381,9 @@
 - 撤回的消息：`deleted` 为真，`content` 为空。撤回后仍留在历史里的平台，照常返回这条消息；`deletedMessagesVanish` 为真的平台，改用 `deleted` 事件（§11.2）。
 - `reactions`：只要给出，就必须是这条消息**此刻的全部**表情。不知道全部就省略，不能只给一部分。
 - `thread` 的含义同 hhh-im 的话题规则：`inThread` 为假的一律不算话题回复。平台没有话题功能时省略。
-- `editedAtMs` 只在平台明确表示“改过”时给出。
+- `thread.copy {role: "conversation"|"thread", peerId, threadId?}`（v12）：话题回复“同时发到会话”时平台给出两条（话题里一条、会话里一条）的，两条各带它：`role` 说这条是哪一边，`peerId` 是另一边那条的编号，`threadId` 是话题编号（会话里那条带着，用来找话题第一条）。宿主在会话里那条上写“来自话题”，两条算同一条回复。
+- `editedAtMs` 只在平台明确表示“改过”时给出。平台不给“改过”标记的，可以在平台说明里声明 `editsByContent`（§5.1），宿主按内容认。
+- `editDraft`（v12）：声明了 `actions.edit.perMessage` 时，本人能编辑的那条给出编辑框里的原文（`Outgoing` 数组，块数预算同发送）；不能编辑就不带。
 - `raw` 只在声明了 `retranslate` 能力时给（§10.1）：`format` 是程序自己定的格式名（例如 `wechat-addmsg-v1`），`data` 是去凭据化的原始数据。宿主把它和消息一起存进原始数据表，供以后重新翻译；**不含任何令牌、密钥、会话材料**。单条上限见 §14。
 
 ### 7.5 内容块（Block）
@@ -334,7 +391,7 @@
 | `type` | 字段 | 说明 |
 |---|---|---|
 | `text` | `text` | 纯文字，原样给出，不含任何标记 |
-| `mention` | `userId`?、`name`?、`everyone` | 经平台结构确认的提及。提及所有人时 `everyone` 为真 |
+| `mention` | `userId`?、`idType`?、`kind`?、`name`?、`everyone` | 经平台结构确认的提及。提及所有人时 `everyone` 为真；`kind`（v14）是 `user` 或 `bot`，不写当 `user`：宿主显示机器人时先用这里的名字，显示人时先用人名册的 |
 | `resource` | `resource: Resource`、`name`?、`width`?、`height`? | 图片、文件、表情包 |
 | `rich` | `root` | 格式正文，即 mdast 的一个子集，节点见 §7.6 |
 | `markdown` | `text` | 平台明确标为 Markdown 的原文，由宿主解析 |
@@ -351,7 +408,9 @@
 
 ### 7.6 格式正文的节点（v1 固定下来）
 
-`paragraph`、`heading{depth}`、`thematicBreak`、`blockquote`、`list{ordered,start}`、`listItem`、`code{lang,value}`、`table{align,pageSize}`、`tableRow`、`tableCell`、`text{value}`、`strong`、`emphasis`、`delete`、`underline`、`inlineCode{value}`、`break`、`link{url}`、`mention{userId,name,everyone}`、`emoji{emojiType}`、`resource{resource,name,width,height}`、`unsupported{kind,label}`、`color{tone}`、`tag{text,tone}`、`person{userId,name}`、`time{ms,format}`。
+`paragraph`、`heading{depth}`、`thematicBreak`、`blockquote`、`list{ordered,start}`、`listItem`、`code{lang,value}`、`table{align,pageSize}`、`tableRow`、`tableCell`、`text{value}`、`strong`、`emphasis`、`delete`、`underline`、`inlineCode{value}`、`break`、`link{url}`、`mention{userId,name,everyone,idType?,kind?}`、`emoji{emojiType}`、`resource{resource,name,width,height}`、`unsupported{kind,label}`、`color{tone}`、`tag{text,tone}`、`person{userId,name,idType?,kind?}`、`time{ms,format}`。
+
+- 人与资源照上面的写法（v14 起宿主照规范收，以前只认宿主内部的写法）：`mention`、`person` 的 `kind` 是 `user` 或 `bot`（不写当 `user`）；`resource.resource` 是 §7.5 的 Resource（`{key, kind, …}`），宿主补上它所在的消息。
 
 - 节点之间的嵌套关系遵守 mdast。宿主对节点数、嵌套深度和文字长度有预算（§14）。
 - 不认识的节点按 `unsupported` 处理。
@@ -381,8 +440,10 @@
 | `messages/get` | `conversationId`、`messageId` | `Message` | `messages.get` |
 | `reactions/list` | `conversationId`、`messageId`、`limit`（不超过 50）、`cursor`? | `{items: Reaction[], next?}` | `reactions.list` |
 | `emoji/catalog` | 无 | `{emojis: Emoji[], categories?, tones?, updatedAtMs}` | `reactions.catalog` |
+| `conversations/recentActivity` | `sinceMs`、`pagesMax` | `{items: [{conversationId, kind, firstMs, latestMs, peerId?}], complete}`：这段时间里有人（不算机器人、应用、经接口发的）发过消息的会话，每个会话一项，按最新一条从新到旧；只用来认会话，不交出消息内容；`peerId` 是私聊的对方；翻满 `pagesMax` 页还没到起点时 `complete` 为假。一次至多 1000 项（v12） | `conversations.recentActivity` |
 
 - `messages/list` 的翻页规则同 hhh-im 的 `MessageQuery`：`newestFirst` 为真时，从最新往更早翻。
+- **这次向平台发了几个请求**（v14，可选）：上表每个方法的结果对象都可以多带 `"platformRequests": <正整数>`。宿主每调一次先记一次平台读取，多出的照样记进这个平台的读取额度（一次调用至多按 64 个记），之后的读取据此等；不写就是 1。
 - **读取不能有副作用**：不能借读取在平台上标已读，也不能改变在线状态。已读未读只在 HHH 本地计算。
 - Emoji 的字段同 hhh-im 的 `EmojiInfo`，只是图片地址换成 `emoji/image` 用的编号。
 
@@ -400,6 +461,7 @@
 - `total` 是整个资源的字节数，不是这一段的长度，能给就尽早给。`sha256` 是平台给的内容指纹（小写十六进制），平台不给就省略。
 - 程序声明了 `fileSegmentBytes` 时，宿主按段读，断了可以续传。没有声明时，宿主从 0 开始连续读到 `eof`，中途断了就从头再读。
 - 这条消息已经没有这个资源时，回 `notFound`，宿主会换别的消息去取，或者标成“读不到”。暂时读不到时，回 `disconnected`。
+- `emoji/image`：声明了 `emoji.unlisted.guess`（v12）时，宿主也会拿目录外的表情类型来问；程序按自己的规律猜，猜不到回 `notFound`，界面写名字。
 
 ### 9.2 上传（发送附件之前）
 
@@ -441,8 +503,7 @@
 
 - 参数：`{ "rule": "<规则名>", "messages": [ { "id", "conversationId", "raw": { "format", "data" } } ] }`。一批不超过 100 条，宿主按 §14 的预算分批。
 - 结果：`{ "messages": [ Message… ] }`，每条是重译后的完整消息；程序不想改的那条可以原样返回，宿主按消息编号覆盖本地记录。
-- `rule` 由程序自己定名（例如 `wechat-miniapp-card-v2`）。宿主按规则名记“这条已经用这个规则重译过”，同一规则不重复重译；程序换了新规则名才会再被调。这对应 hhh-im 现有的 `content_rereads` 机制，区别是数据来自程序的 `raw` 而不是平台重读。
-- 程序声明哪些规则、以及规则适用于哪些消息（靠 `raw.format` 或 `data` 里的特征），由程序在实现文档里说明；宿主只负责按规则名调一次、存结果、记已重译。
+- `rule` 由程序自己定名（例如 `wechat-miniapp-card-v2`），写在平台说明的 `retranslateRules` 里（v12，§5.1）。宿主每次打开时按顺序看：存着原始数据、`format` 对得上（规则写了 `formats` 时）、这个规则还没做过的旧消息，每批至多 100 条交给它；按规则名记“这条已经用这个规则重译过”，同一规则不重复重译；程序换了新规则名才会再被调。不联网、不占平台读取额度；这一批出错不记，下次打开再试。这对应 hhh-im 现有的 `content_rereads` 机制，区别是数据来自程序的 `raw` 而不是平台重读。
 
 ## 11. 推送
 
@@ -526,7 +587,7 @@ JSON-RPC 的 `error.code` 按下表取值；`error.data` 里写明错误分类�
 | 1009 | `cancelled` | 请求被宿主取消了（Cancelled） |
 | 1010 | `limitExceeded` | 超出平台限制，比如文件太大（LimitExceeded） |
 
-`userMessage` 用宿主在 `initialize` 里给的 `locale` 来写，不能包含令牌或平台的原始响应。`platformCode` 原样记成文字。
+`userMessage` 用宿主在 `initialize` 里给的 `locale` 来写，不能包含令牌或平台的原始响应。`platformCode` 原样记成文字。`reactions/list` 因为缺权限回 `permissionDenied` 时，`userMessage` 写清要开哪个权限、怎么补（v12）：宿主读不到表情时给用户的提示就用这句话。
 
 ## 13. 取消、超时与并发
 
@@ -565,6 +626,13 @@ JSON-RPC 的 `error.code` 按下表取值；`error.data` 里写明错误分类�
 | 单条消息的 `raw` 原始数据 | 256 KiB |
 | 一次 `messages/retranslate` | 100 条 |
 | 日志行、`log/write` 的 `message` | 截到 4 KiB |
+| 登录方式（v12） | 至多 8 种；每段文字（叫法、说明、灰字、链接文字）至多 200 字 |
+| 登录时填的每个值、回调地址（v12） | 8 KiB |
+| `session/notice`（v12） | 至多 20 条，每条至多 200 字（超出的那条不显示） |
+| `conversations/recentActivity` 的结果（v12） | 一次至多 1000 项（多出的不用） |
+| `retranslateRules`（v12） | 至多 32 条（重复的名字不用） |
+| 平台说明里的正则（`textPattern` 等，v12） | 1 KiB |
+| `editDraft`（v12） | 块数同发送 |
 
 宿主还会核对这几件事：
 - 结果里的会话编号和请求的一致。
@@ -616,6 +684,7 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 7. 取消有效，`ping` 及时回复，`shutdown` 后 5 秒内退出。
 8. 发送：只读程序会拒绝发送；拿不准的发送回 `unknown`，并且不重发。这一项需要 `--allow-send`。
 9. 凭据：程序先存后用；宿主拒绝保存时，程序保留旧凭据。
+10. v12 的新声明（没声明的跳过）：`userAdjustable`、`editsByContent` 的取值宿主认得出；`retranslateRules` 名字不重复；`emoji.textPattern` 能编译、有一个括号；`logoInk` 是合法的外框；`loginMethods` 的类型认得出、编号不重复、不超过 8 种，`callbackPath` 在这个 IM 自己的 `/hhh-friend-im/<平台编号>/` 下面；声明了 `conversations.recentActivity` 就要能回合法结果，声明了 `session.renew` 就要能答。
 
 `--mock` 要求程序支持不联网的模拟模式（见实现范式 §9）；`--live --read-only` 用真实账号，只做读取。
 
@@ -640,6 +709,8 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 | `messages/retranslate` | `ImClient::content_rereads` → `ContentReread`（新增：数据来自程序的 `raw`，不联网） |
 | `log/write` | 宿主日志系统（新增：程序把结构化日志透给宿主） |
 | `login/*`、`credential/save`、`session/expired` | Friend 的授权和凭据保存（`StoreGrantBackend`）；外部程序走一套通用流程 |
+| `conversations/recentActivity`（v12） | `ImClient::recent_activity`（会话发现，同内置飞书、Slack） |
+| `session/notice`、`session/renew`、`login/callback`（v12） | Friend 的插件卡问题行、插件续期任务、本机回调路由 |
 
 协议的线上类型和 hhh-im 的内部类型分开定义、分开冻结，由适配器在两边之间翻译。这样内部模型怎么改，都不会影响已经发布的程序。协议里没有连接编号，`connection_id` 和 `ActorRef.id_type` 由适配器补上。
 
@@ -647,7 +718,7 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 
 结构同 hhh-im `ImCard` 的 JSON：`{title?, subtitle?, tags[], tone, wide, blocks[]}`。
 
-- 块的种类：`paragraph{parts: [{type: "markdown", text}]}`、`columns{columns}`、`divider`、`rich{children}`、`images{columns, images: [{resource, alt?, width?, height?}]}`、`people{people: [{userId, name}], size, avatar, name}`、`panel{title, expanded, border, blocks}`。
+- 块的种类：`paragraph{parts: [{type: "markdown", text}]}`、`columns{columns}`、`divider`、`rich{children}`、`images{columns, images: [{resource, alt?, width?, height?}]}`、`people{people: [{userId, name, idType?, kind?}], size, avatar, name}`、`panel{title, expanded, border, blocks}`。`images[].resource` 是 §7.5 的 Resource，`rich`、`panel.title` 里的节点同 §7.6。
 - 色调取值：`neutral`、`grey`、`blue`、`green`、`yellow`、`orange`、`red`、`purple`。
 - 这套结构在 v1 固定下来。
 
@@ -671,6 +742,22 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 
 （`→` 是宿主发给程序的，`←` 是程序发给宿主的。）
 
+## 附录 D：内置平台交给程序的授权（`hhh-builtin-v1`，v12）
+
+带官方签名、编号是保留编号的程序第一次打开、还没有自己的凭据，而同编号的内置平台登录着（授权没失效）时，宿主在 `session/open.legacy` 里交一次：
+
+```json
+{ "format": "hhh-builtin-v1",
+  "credential": "{\"accessToken\":\"…\",\"refreshToken\":\"…\",\"expiresAt\":1791090000,\"scopes\":[\"…\"],\"account\":{\"id\":\"…\",\"name\":\"…\"}}",
+  "settings": { "mode": "relay", "relayUrl": "https://…", "appId": "…", "appSecret": "…" } }
+```
+
+- `credential` 是一段 JSON 文字：内置平台的访问令牌 `accessToken`、刷新令牌 `refreshToken`、访问令牌的过期时刻 `expiresAt`（Unix 秒）、权限 `scopes`，以及上次核验的账号 `account {id, name}`；内置平台没有的项为 null 或省略。
+- `settings` 是内置平台在 HHH 连接设置里的那一栏原样（各平台字段不同，如登录方式 `mode`、`appId`、`relayUrl`），其中存在系统凭据库里的密钥换成明文（如 `appSecret`），授权的引用去掉。密钥只经标准输入交这一次，宿主不写日志。
+- 程序接过后先用自己的格式经 `credential/save` 存凭据，收到宿主的成功回复之后再回 `online`（同 §6.3 先存后用），在 `online` 结果里用 `adoptedSettings`（§4.2）告诉宿主要写进它设置里的东西。宿主在程序回 `online` 时凭据已经存好，才删内置那份（连接设置那一栏与它引用的密钥）；没接成（没在线，或回 `online` 时还没存好）内置那份不动，程序还没有自己的凭据时下次打开再交——先回 `online`、后存凭据的程序，这一次不算接过，之后也不会再交。同一个编号同一时间只留一份在用的凭据；关注、本机消息与文件照旧（同编号共用一份本机数据）。
+
 ## 变更记录
 
 - 2026-10-04：v1 草案。补入 `log/write`（结构化日志）、消息 `raw` 原始数据与 `messages/retranslate`（可重新翻译）、`history=none` 平台存全部会话并走发现路径、上传即发送的平台说明、信任边界措辞纠正。
+- 2026-10-10（契约 v12，全部为可选的加法，主版本仍是 1）：会话发现（`discovery`、`conversations/recentActivity`、能力 `conversations.recentActivity`、`readDefaults.discover`）；读取与下载的数放开数值范围、`reads` 不再必填、`userAdjustable`；`editsByContent`；`retranslateRules`；`session/notice` 与 `Account.tenant` 的显示、`reactions/list` 缺权限时的 `userMessage`；登录方式 `loginMethods`、`login/start` 的 `{method, values, callbackUrl, state}`、`login/callback`；续期 `credential/save.renewAtMs`、`session/renew`、能力 `session.renew`、`session/open.credentialReadOnly`；`emoji.unlisted.guess`、`emoji.textPattern`、`emoji.whiteBackground`；清单 `logoStyle`、`logoInk`；`actions.edit.perMessage` 与消息 `editDraft`；`thread.copy`；保留编号与交接（`session/open.legacy`、`adoptedSettings`、附录 D）；§5.1“刻意不设”删去“不猜表情图”“不比内容认编辑”两项；§14 新预算；§17 新检查。
+- 2026-10-11（契约 v14，全部为可选的加法，主版本仍是 1）：编号种类 `idType`（账号、发送者、人员、提及与格式正文、卡片里的人）；格式正文与卡片里的人与资源宿主照 §7.6、附录 B 的写法收；读取结果可带 `platformRequests`；`loginMethods` 的 `callbackPath` 可写相对路径、`relay` 可写 `defaultValue`、`ownApp` 可写 `secretHelp`；`mention` 块可带 `kind`；`avatarIdentity`；表情的肤色版本（`tone`、`toneOf`）与目录的 `tones`，以及目录的 `categories`，宿主照收（以前丢掉）；`emoji.unlisted.guessPattern`；宿主照声明处理 `conversationNouns`、`emoji.namePattern`、`unlisted` 的占位；平台编号只由宿主定（协议包不再推）。

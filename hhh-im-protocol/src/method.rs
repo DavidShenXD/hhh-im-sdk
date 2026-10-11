@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::platform::{Capabilities, PlatformDesc, SettingDecl};
 use crate::rpc::ReauthReason;
 use crate::types::{
-    Account, Emoji, EmojiCategory, Event, Message, Outgoing, Person, Raw, ResourceKind,
-    SendOutcome, SendTarget,
+    Account, ConversationKind, Emoji, EmojiCategory, EmojiTone, Event, Message, Outgoing, Person,
+    Raw, ResourceKind, SendOutcome, SendTarget,
 };
 
 /// 协议里的方法名。字符串形式见 [`Method::as_str`]。
@@ -39,11 +39,17 @@ pub enum Method {
     LoginFinished,
     /// 登录失败（插件→宿主通知）。
     LoginFailed,
+    /// 把本机回调交给插件（宿主→插件，契约 provider-protocol v12 缺口 6）。
+    LoginCallback,
     // —— 凭据与授权（插件→宿主）——
     /// 保存凭据（插件→宿主）。
     CredentialSave,
     /// 授权失效（插件→宿主通知）。
     SessionExpired,
+    /// 这个连接现在有的问题（插件→宿主通知，契约 provider-protocol v12 缺口 5）。
+    SessionNotice,
+    /// 用存着的凭据续期（宿主→插件，契约 provider-protocol v12 缺口 7）。
+    SessionRenew,
     // —— 读取（宿主→插件）——
     /// 列会话。
     ConversationsList,
@@ -55,6 +61,8 @@ pub enum Method {
     ConversationsMembers,
     /// 定位已有私聊。
     ConversationsFindDirect,
+    /// 一段时间里有人发过消息的会话（会话发现，契约 provider-protocol v12 缺口 1）。
+    ConversationsRecentActivity,
     /// 批量读人。
     PeopleGet,
     /// 搜人。
@@ -125,13 +133,17 @@ impl Method {
             Method::LoginStep => "login/step",
             Method::LoginFinished => "login/finished",
             Method::LoginFailed => "login/failed",
+            Method::LoginCallback => "login/callback",
             Method::CredentialSave => "credential/save",
             Method::SessionExpired => "session/expired",
+            Method::SessionNotice => "session/notice",
+            Method::SessionRenew => "session/renew",
             Method::ConversationsList => "conversations/list",
             Method::ConversationsGet => "conversations/get",
             Method::ConversationsSearch => "conversations/search",
             Method::ConversationsMembers => "conversations/members",
             Method::ConversationsFindDirect => "conversations/findDirect",
+            Method::ConversationsRecentActivity => "conversations/recentActivity",
             Method::PeopleGet => "people/get",
             Method::PeopleSearch => "people/search",
             Method::MessagesList => "messages/list",
@@ -183,13 +195,17 @@ impl Method {
             Method::LoginStep,
             Method::LoginFinished,
             Method::LoginFailed,
+            Method::LoginCallback,
             Method::CredentialSave,
             Method::SessionExpired,
+            Method::SessionNotice,
+            Method::SessionRenew,
             Method::ConversationsList,
             Method::ConversationsGet,
             Method::ConversationsSearch,
             Method::ConversationsMembers,
             Method::ConversationsFindDirect,
+            Method::ConversationsRecentActivity,
             Method::PeopleGet,
             Method::PeopleSearch,
             Method::MessagesList,
@@ -269,6 +285,9 @@ pub struct InitializeResult {
     /// 程序设置项。
     #[serde(default)]
     pub settings: Vec<SettingDecl>,
+    /// 支持的登录方式，按显示顺序（契约 provider-protocol v12 缺口 6）；不写就是只有一种、点登录直接走插件推来的步骤。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub login_methods: Vec<LoginMethod>,
 }
 
 /// 插件信息。
@@ -295,6 +314,53 @@ pub struct SessionOpenParams {
     /// 上次保存的同步游标；没有为空。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_state: Option<String>,
+    /// 这份凭据是借来的、只能用（隔离测试实例借用户的，契约 provider-protocol v12 缺口 7）：插件不得换新凭据、
+    /// 不得调 `credential/save`，到期就发 `session/expired`。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credential_read_only: bool,
+    /// 同一编号的内置平台留下的授权与设置，交给插件一次（契约 provider-protocol v12 缺口 14，格式见规范附录 D）；
+    /// 只在插件还没有自己的凭据时给。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy: Option<LegacyHandover>,
+}
+
+/// 内置平台交给插件的授权与设置（`session/open.legacy`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyHandover {
+    /// 格式名；本版只有 [`LEGACY_FORMAT_BUILTIN_V1`]。
+    pub format: String,
+    /// 内置授权（格式里定义的 JSON 文字）。
+    pub credential: String,
+    /// 内置平台的连接设置（格式里定义的 JSON 对象）。
+    #[serde(default)]
+    pub settings: serde_json::Value,
+}
+
+/// 内置飞书、Slack 交接用的格式名（规范附录 D）。
+pub const LEGACY_FORMAT_BUILTIN_V1: &str = "hhh-builtin-v1";
+
+/// 插件接过交接后，请宿主写进它自己设置里的东西（`session/open` 在线结果的 `adoptedSettings`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptedSettings {
+    /// 写进插件参数配置的值（键是插件声明的设置项编号）。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub parameters: std::collections::BTreeMap<String, String>,
+    /// 写成“现在在用”的登录方式与填的内容（键见 [`login_value`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<AdoptedLogin>,
+}
+
+/// 交接后在用的登录方式。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptedLogin {
+    /// 登录方式编号（插件 `loginMethods` 里的 `id`）。
+    pub method: String,
+    /// 填的内容。
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, String>,
 }
 
 /// `session/open` 结果（protocol-v1 §4.2）。
@@ -309,6 +375,9 @@ pub enum SessionOpenResult {
     Online {
         /// 已核验账号。
         account: Account,
+        /// 接过交接时请宿主写进插件设置的东西（契约 provider-protocol v12 缺口 14）；没有为空。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adopted_settings: Option<AdoptedSettings>,
     },
     /// 需要登录。
     NeedsLogin {
@@ -334,6 +403,170 @@ pub enum NeedsLoginReason {
 }
 
 // ============================ 登录 ============================
+
+/// 登录方式的类型：由 IM 层定，各 IM 声明支持哪几种（契约 provider-protocol v12 缺口 6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoginKind {
+    /// 经公网授权中继：登录前填中继地址（[`login_value::RELAY_URL`]）。
+    Relay,
+    /// 用户自己的应用：登录前填 App ID 与 App Secret（[`login_value::APP_ID`]、[`login_value::APP_SECRET`]）。
+    OwnApp,
+    /// 直接登录：不用填，照插件推来的步骤走。
+    Direct,
+    /// 宿主不认识的类型：这一种方式不登记。
+    #[serde(other)]
+    Unknown,
+}
+
+/// `login/start.values` 里各类型用的键。
+pub mod login_value {
+    /// 中继地址（`relay`）。
+    pub const RELAY_URL: &str = "relayUrl";
+    /// App ID（`ownApp`）。
+    pub const APP_ID: &str = "appId";
+    /// App Secret（`ownApp`）；只在用户这次填了时给，没填表示沿用插件凭据里的。
+    pub const APP_SECRET: &str = "appSecret";
+}
+
+/// 一种登录方式（`initialize.loginMethods`）：类型由 IM 层定，叫法、说明、灰字、链接由 IM 写。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginMethod {
+    /// 方式编号（插件内不重复，宿主据此记“现在在用哪种”）。
+    pub id: String,
+    /// 类型。
+    pub kind: LoginKind,
+    /// 叫法（页签上的字）。
+    pub label: String,
+    /// 一句说明。
+    #[serde(default)]
+    pub note: String,
+    /// `relay`：中继地址框的灰字。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    /// `relay`：没保存过中继地址时框里预填的地址（https，或本机测试的回环 http；v14）。不写就空着让用户填。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+    /// `ownApp`：App ID 的叫法（默认 App ID）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_label: Option<String>,
+    /// `ownApp`：App ID 框的灰字。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_placeholder: Option<String>,
+    /// `ownApp`：App Secret 的叫法（默认 App Secret）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_label: Option<String>,
+    /// `ownApp`：App Secret 框的灰字。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_placeholder: Option<String>,
+    /// `ownApp`：App Secret 去哪找、存在哪的说明（画在框旁的 ⓘ 里；v14）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_help: Option<String>,
+    /// `ownApp`：要宿主在本机收授权回调时的路径；不写就没有回调。写成相对路径（如 `callback`，v14）时宿主拼在这个 IM
+    /// 自己的 `/hhh-friend-im/<平台编号>/` 下面（[`resolve_callback_path`]），插件不必知道宿主怎么给它编号；照 v12 写成
+    /// 以 `/` 开头的完整路径时必须已经在这个目录下。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_path: Option<String>,
+    /// `ownApp`：回调地址的说明（画在 ⓘ 里）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_help: Option<String>,
+    /// 可选的“前往…创建”链接（只收 https）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_link: Option<CreateLink>,
+}
+
+/// 登录方式里的一个外部链接。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateLink {
+    /// 链接文字。
+    pub label: String,
+    /// 地址（https）。
+    pub url: String,
+    /// 链接后面接的一句话。
+    #[serde(default)]
+    pub after: String,
+}
+
+/// 回调路径必须在的目录：`/hhh-friend-im/<平台编号>/`。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::method::callback_path_ok;
+/// assert!(callback_path_ok("/hhh-friend-im/ext-sample/callback", "ext-sample"));
+/// assert!(!callback_path_ok("/hhh-friend-im/feishu/callback", "ext-sample"));
+/// assert!(!callback_path_ok("/hhh-friend-im/ext-sample/", "ext-sample"));
+/// assert!(!callback_path_ok("/hhh-friend-im/ext-sample/../feishu/callback", "ext-sample"));
+/// ```
+pub fn callback_path_ok(path: &str, platform_id: &str) -> bool {
+    let prefix = format!("/hhh-friend-im/{platform_id}/");
+    let Some(rest) = path.strip_prefix(&prefix) else {
+        return false;
+    };
+    !rest.is_empty()
+        && path.len() <= 256
+        && rest.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        })
+}
+
+/// 插件声明的回调路径在宿主上的完整路径（契约 provider-protocol v14）：相对路径拼在 `/hhh-friend-im/<平台编号>/` 下面，
+/// 以 `/` 开头的照 v12 原样用；不在这个 IM 自己的目录下、或某一段不合规时为空（宿主不登记这种登录方式）。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::method::resolve_callback_path;
+/// assert_eq!(resolve_callback_path("callback", "feishu").as_deref(), Some("/hhh-friend-im/feishu/callback"));
+/// assert_eq!(resolve_callback_path("oauth/done", "ext-sample").as_deref(), Some("/hhh-friend-im/ext-sample/oauth/done"));
+/// assert_eq!(resolve_callback_path("/hhh-friend-im/ext-sample/callback", "ext-sample").as_deref(), Some("/hhh-friend-im/ext-sample/callback"));
+/// assert_eq!(resolve_callback_path("/hhh-friend-im/feishu/callback", "ext-sample"), None);
+/// assert_eq!(resolve_callback_path("../feishu/callback", "ext-sample"), None);
+/// assert_eq!(resolve_callback_path("", "ext-sample"), None);
+/// ```
+pub fn resolve_callback_path(path: &str, platform_id: &str) -> Option<String> {
+    let full = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/hhh-friend-im/{platform_id}/{path}")
+    };
+    callback_path_ok(&full, platform_id).then_some(full)
+}
+
+/// `login/start` 参数（契约 provider-protocol v12 缺口 6）。旧宿主发 `{}`，旧插件忽略多出的字段。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginStartParams {
+    /// 这次选的登录方式编号（插件声明了 `loginMethods` 时给）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// 这次填的内容（键见 [`login_value`]）。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub values: std::collections::BTreeMap<String, String>,
+    /// 宿主在本机收回调的完整地址（这种方式声明了 `callbackPath` 时给）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_url: Option<String>,
+    /// 一次性的 `state`：插件放进授权地址，回调带回来时宿主核对（给了 `callbackUrl` 时给）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+}
+
+/// `login/callback` 参数（宿主→插件）：宿主在本机收到这次登录的回调、`state` 对上了，把整个地址交给插件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginCallbackParams {
+    /// 登录流程编号。
+    pub flow_id: String,
+    /// 回调的完整地址（含查询串）。
+    pub url: String,
+}
 
 /// `login/start` 结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,6 +731,39 @@ pub struct LoginFailedParams {
 pub struct CredentialSaveParams {
     /// 不透明凭据（≤64 KiB）。
     pub credential: String,
+    /// 下次要续期的时间（毫秒，契约 provider-protocol v12 缺口 7）：到了宿主叫 `session/renew`，插件没在跑也临时起来续。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renew_at_ms: Option<i64>,
+}
+
+/// `session/renew` 参数（宿主→插件，需要能力 `session.renew`）：用这份凭据续期，经 `credential/save` 存新的再回空结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRenewParams {
+    /// 宿主存着的凭据。
+    pub credential: String,
+}
+
+/// `session/notice` 通知参数（插件→宿主）：这个连接现在有的问题，每次给全，空数组就是都没有了。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNoticeParams {
+    /// 问题。
+    #[serde(default)]
+    pub notices: Vec<Notice>,
+}
+
+/// 连接上的一个问题（画在卡片下面的问题行）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Notice {
+    /// 编号（同一个问题前后不变）。
+    pub id: String,
+    /// 给用户看的一句话（不超过 [`crate::budget::NOTICE_MAX_CHARS`] 个字）。
+    pub text: String,
+    /// 要重新登录才能好：卡片右边多一颗“重新登录”。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relogin: bool,
 }
 
 /// `session/expired` 通知参数。
@@ -682,6 +948,9 @@ pub struct EmojiCatalogResult {
     /// 分类。
     #[serde(default)]
     pub categories: Vec<EmojiCategory>,
+    /// 肤色，按面板里的顺序（v14）；没有肤色选择时不写。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tones: Vec<EmojiTone>,
     /// 目录更新时间（毫秒）。
     pub updated_at_ms: i64,
 }
@@ -874,6 +1143,45 @@ pub struct ReactionsRemoveParams {
     pub reaction_id: String,
 }
 
+/// `conversations/recentActivity` 参数（会话发现，契约 provider-protocol v12 缺口 1）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentActivityParams {
+    /// 从这个时间（毫秒）起，含这一刻。
+    pub since_ms: i64,
+    /// 一次最多翻几页。
+    pub pages_max: u16,
+}
+
+/// `conversations/recentActivity` 结果。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentActivityResult {
+    /// 这段时间里有人（不算机器人、应用、经接口发的）发过消息的会话，每个会话一项，按最新一条从新到旧。
+    #[serde(default)]
+    pub items: Vec<ActivityItem>,
+    /// 翻到了起点；翻满页数还没到时为假。
+    #[serde(default)]
+    pub complete: bool,
+}
+
+/// 一段时间里有人发过消息的一个会话（只用来认会话，不交出消息内容）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityItem {
+    /// 会话编号。
+    pub conversation_id: String,
+    /// 会话类别。
+    pub kind: ConversationKind,
+    /// 这段时间里最早一条的时间（毫秒）。
+    pub first_ms: i64,
+    /// 最新一条的时间（毫秒）。
+    pub latest_ms: i64,
+    /// 私聊的对方（不是本人的发送者）；群或只有本人发过时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<String>,
+}
+
 /// `messages/retranslate` 参数（protocol-v1 §10.1）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -979,6 +1287,24 @@ pub struct CancelParams {
 
 #[cfg(test)]
 mod tests {
+
+    // 契约 provider-protocol v14：登录方式的默认中继、App Secret 的说明、相对的回调路径都可选、原样往返。
+    #[test]
+    fn v14_login_method_fields_are_optional_and_round_trip() {
+        let relay = serde_json::json!({ "id": "relay", "kind": "relay", "label": "通过中继登录", "note": "说明",
+            "defaultValue": "https://relay.example.com" });
+        let own = serde_json::json!({ "id": "own", "kind": "ownApp", "label": "使用自己的应用", "note": "",
+            "secretHelp": "开放平台 → 凭证与基础信息。只保存在本机。", "callbackPath": "callback" });
+        for declared in [relay, own] {
+            let method: LoginMethod = serde_json::from_value(declared.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&method).unwrap(), declared);
+        }
+        let old: LoginMethod = serde_json::from_value(
+            serde_json::json!({ "id": "own", "kind": "ownApp", "label": "自己的应用" }),
+        )
+        .unwrap();
+        assert!(old.default_value.is_none() && old.secret_help.is_none());
+    }
     use super::*;
 
     #[test]
@@ -998,6 +1324,82 @@ mod tests {
         );
         assert_eq!(Method::Cancel.as_str(), "$/cancel");
         assert!(Method::from_name("does/not-exist").is_none());
+        for (m, name) in [
+            (
+                Method::ConversationsRecentActivity,
+                "conversations/recentActivity",
+            ),
+            (Method::SessionNotice, "session/notice"),
+            (Method::SessionRenew, "session/renew"),
+            (Method::LoginCallback, "login/callback"),
+        ] {
+            assert_eq!(m.as_str(), name);
+            assert_eq!(Method::from_name(name), Some(m));
+        }
+    }
+
+    // 契约 provider-protocol v12：登录、续期、交接相关的新字段都是可选的——旧插件、旧宿主的形状照读，写回不多出键。
+    #[test]
+    fn v12_session_and_login_fields_are_optional_and_round_trip() {
+        use serde_json::json;
+        // login/start：旧宿主发 {}，读成全空；新宿主给方式、内容、回调地址与 state。
+        let old: LoginStartParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(old, LoginStartParams::default());
+        assert_eq!(serde_json::to_value(&old).unwrap(), json!({}));
+        let start = json!({ "method": "own", "values": { "appId": "cli_1", "appSecret": "s" },
+            "callbackUrl": "http://localhost:29527/hhh-friend-im/ext-sample/callback", "state": "st" });
+        let parsed: LoginStartParams = serde_json::from_value(start.clone()).unwrap();
+        assert_eq!(parsed.values[login_value::APP_ID], "cli_1");
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), start);
+
+        // session/open：不借用、没有交接时不多出键；在线结果不带 adoptedSettings 时照旧。
+        let open: SessionOpenParams = serde_json::from_value(json!({ "settings": {} })).unwrap();
+        assert!(!open.credential_read_only && open.legacy.is_none());
+        let v = serde_json::to_value(&open).unwrap();
+        assert!(v.get("credentialReadOnly").is_none() && v.get("legacy").is_none());
+        let online: SessionOpenResult = serde_json::from_value(
+            json!({ "state": "online", "account": { "id": "u1", "name": "我" } }),
+        )
+        .unwrap();
+        assert!(matches!(
+            online,
+            SessionOpenResult::Online {
+                adopted_settings: None,
+                ..
+            }
+        ));
+        let adopted = json!({ "state": "online", "account": { "id": "u1", "name": "我" },
+            "adoptedSettings": { "parameters": { "topic": "on" }, "login": { "method": "relay", "values": { "relayUrl": "https://r.example" } } } });
+        let back: SessionOpenResult = serde_json::from_value(adopted.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), adopted);
+
+        // credential/save 的续期时间、session/notice 每次给全。
+        let save: CredentialSaveParams =
+            serde_json::from_value(json!({ "credential": "c" })).unwrap();
+        assert!(save.renew_at_ms.is_none());
+        let notice: SessionNoticeParams = serde_json::from_value(
+            json!({ "notices": [{ "id": "scope", "text": "缺少权限 xxx", "relogin": true }] }),
+        )
+        .unwrap();
+        assert!(notice.notices[0].relogin);
+        assert_eq!(
+            serde_json::from_value::<SessionNoticeParams>(json!({})).unwrap(),
+            SessionNoticeParams::default()
+        );
+
+        // 登录方式：不认识的类型读成 Unknown，不让整个握手失败。
+        let method: LoginMethod =
+            serde_json::from_value(json!({ "id": "x", "kind": "passkey", "label": "通行密钥" }))
+                .unwrap();
+        assert_eq!(method.kind, LoginKind::Unknown);
+
+        // 会话发现的结果。
+        let activity: RecentActivityResult = serde_json::from_value(json!({
+            "items": [{ "conversationId": "c1", "kind": "direct", "firstMs": 1, "latestMs": 2, "peerId": "u2" }],
+            "complete": true
+        }))
+        .unwrap();
+        assert_eq!(activity.items[0].peer_id.as_deref(), Some("u2"));
     }
 
     #[test]

@@ -73,4 +73,20 @@ pub mod budget {
     pub const RETRANSLATE_BATCH_MAX: usize = 100;
     /// 日志行、`log/write` 的 message 截断到多少字节。
     pub const LOG_LINE_MAX_BYTES: usize = 4 * 1024;
+    /// 一个插件最多声明几种登录方式（契约 provider-protocol v12 缺口 6）。
+    pub const LOGIN_METHODS_MAX: usize = 8;
+    /// 登录方式里每段文字（叫法、说明、灰字、链接文字）最多几个字（按字符数）。
+    pub const LOGIN_TEXT_MAX_CHARS: usize = 200;
+    /// 登录时填的每个值、回调地址最多多少字节。
+    pub const LOGIN_VALUE_MAX_BYTES: usize = 8 * 1024;
+    /// `session/notice` 一次最多几条问题（多出的不显示）。
+    pub const NOTICES_MAX: usize = 20;
+    /// 一条问题最多几个字（按字符数）；超出的那条不显示。
+    pub const NOTICE_MAX_CHARS: usize = 200;
+    /// `conversations/recentActivity` 一次最多几项（多出的不用）。
+    pub const RECENT_ACTIVITY_ITEMS_MAX: usize = 1000;
+    /// 最多声明几条重译规则。
+    pub const RETRANSLATE_RULES_MAX: usize = 32;
+    /// 平台说明里的正则（表情写法）最长多少字节。
+    pub const PATTERN_MAX_BYTES: usize = 1024;
 }

@@ -289,6 +289,7 @@ async fn run(args: Args) -> i32 {
             format!("{:?}", init["protocolVersion"]),
         );
     }
+    check_v12_declarations(&mut report, &manifest, &platform, &init);
 
     // 4. session/open。
     let open = call_t(
@@ -331,6 +332,7 @@ async fn run(args: Args) -> i32 {
 
     // 给推送一点时间到达。
     tokio::time::sleep(Duration::from_millis(300)).await;
+    check_v12_calls(&conn, &mut report, &caps, online).await;
 
     // 5–7. 推送数据的检查（push-only 平台）。
     if platform.history == HistoryMode::None && online {
@@ -374,6 +376,240 @@ async fn run(args: Args) -> i32 {
     report.pass("shutdown 后进程结束");
 
     report.print_and_code()
+}
+
+/// 契约 provider-protocol v12 的新声明：声明了就要写对，没声明的跳过。
+fn check_v12_declarations(
+    report: &mut Report,
+    manifest: &Manifest,
+    platform: &PlatformDesc,
+    init: &Value,
+) {
+    use hhh_im_protocol::platform::{Adjustable, ContentKind};
+    if platform.user_adjustable.is_empty() {
+        report.skip("开放的读取项认得出", "没声明 userAdjustable");
+    } else if platform.user_adjustable.contains(&Adjustable::Unknown) {
+        report.fail(
+            "开放的读取项认得出",
+            "userAdjustable 里有宿主不认识的取值（这一项不会出现在参数配置里）",
+        );
+    } else {
+        report.pass("开放的读取项认得出");
+    }
+    if platform.edits_by_content.is_empty() {
+        report.skip("按内容认编辑的取值认得出", "没声明 editsByContent");
+    } else if platform.edits_by_content.contains(&ContentKind::Unknown) {
+        report.fail(
+            "按内容认编辑的取值认得出",
+            "editsByContent 里有宿主不认识的内容块种类",
+        );
+    } else {
+        report.pass("按内容认编辑的取值认得出");
+    }
+    if platform.retranslate_rules.is_empty() {
+        report.skip("重译规则名不重复", "没声明 retranslateRules");
+    } else {
+        let mut seen = std::collections::BTreeSet::new();
+        match platform
+            .retranslate_rules
+            .iter()
+            .find(|rule| rule.name.trim().is_empty() || !seen.insert(rule.name.as_str()))
+        {
+            None => report.pass("重译规则名不重复"),
+            Some(rule) => report.fail(
+                "重译规则名不重复",
+                format!("规则名“{}”是空的或重复了（宿主不用它）", rule.name),
+            ),
+        }
+    }
+    match platform
+        .emoji
+        .as_ref()
+        .and_then(|emoji| emoji.text_pattern.as_deref())
+    {
+        None => report.skip("正文表情写法能编译", "没声明 emoji.textPattern"),
+        Some(pattern) => match pattern_problem(pattern, "表情名") {
+            None => report.pass("正文表情写法能编译"),
+            Some(why) => report.fail("正文表情写法能编译", why),
+        },
+    }
+    match &platform.avatar_identity {
+        None => report.skip("头像身份写法能编译", "没声明 avatarIdentity"),
+        Some(identity) => match pattern_problem(&identity.key_pattern, "头像编号").or_else(|| {
+            identity
+                .variant_pattern
+                .as_deref()
+                .and_then(|pattern| pattern_problem(pattern, "变体"))
+        }) {
+            None => report.pass("头像身份写法能编译"),
+            Some(why) => report.fail("头像身份写法能编译", why),
+        },
+    }
+    if manifest.logo_ink.is_none() {
+        report.skip("标志外框在画布内", "清单没写 logoInk");
+    } else if manifest.logo_ok() {
+        report.pass("标志外框在画布内");
+    } else {
+        report.fail(
+            "标志外框在画布内",
+            "logoInk 的四个数要是有限数，宽、高大于 0",
+        );
+    }
+    check_login_methods(report, manifest, init);
+}
+
+/// 登录方式（缺口 6）：类型认得出、编号不重复、不超过宿主上限；声明的回调路径在这个 IM 自己的 `/hhh-friend-im/<编号>/` 下面。
+fn check_login_methods(report: &mut Report, manifest: &Manifest, init: &Value) {
+    use hhh_im_protocol::method::{
+        LoginKind, LoginMethod, callback_path_ok, resolve_callback_path,
+    };
+    let Some(declared) = init.get("loginMethods").filter(|v| !v.is_null()) else {
+        report.skip("登录方式写法对", "没声明 loginMethods");
+        report.skip("回调路径在本 IM 目录下", "没声明回调路径");
+        return;
+    };
+    let methods: Vec<LoginMethod> = match serde_json::from_value(declared.clone()) {
+        Ok(methods) => methods,
+        Err(e) => {
+            report.fail("登录方式写法对", format!("loginMethods 格式不对：{e}"));
+            return;
+        }
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    let problem =
+        if methods.len() > hhh_im_protocol::budget::LOGIN_METHODS_MAX {
+            Some(format!(
+                "至多 {} 种，声明了 {} 种",
+                hhh_im_protocol::budget::LOGIN_METHODS_MAX,
+                methods.len()
+            ))
+        } else {
+            methods.iter().find_map(|m| {
+                if m.kind == LoginKind::Unknown {
+                    Some(format!("“{}”的类型宿主不认识（不会出现在登录框里）", m.id))
+                } else if m.id.trim().is_empty() || !ids.insert(m.id.as_str()) {
+                    Some(format!("编号“{}”是空的或重复了", m.id))
+                } else if m.default_value.as_deref().is_some_and(|value| {
+                    m.kind != LoginKind::Relay || !value.starts_with("https://")
+                }) {
+                    // v14：默认中继只给“通过中继登录”，发布的插件只写 https（本机测试的回环地址宿主也认，但不该发出去）。
+                    Some(format!(
+                        "“{}”的默认值只能给通过中继登录、写 https 网址",
+                        m.id
+                    ))
+                } else {
+                    None
+                }
+            })
+        };
+    match problem {
+        None => report.pass("登录方式写法对"),
+        Some(why) => report.fail("登录方式写法对", why),
+    }
+    let paths: Vec<&str> = methods
+        .iter()
+        .filter_map(|m| m.callback_path.as_deref())
+        .collect();
+    if paths.is_empty() {
+        report.skip("回调路径在本 IM 目录下", "没声明回调路径");
+        return;
+    }
+    // 平台编号由宿主给（一般在插件编号前加前缀，保留编号就是编号本身），自检不替宿主推；相对路径（v14）怎么编号都拼得对，
+    // 以 `/` 开头的完整路径（v12 写法）只能核对是不是按编号本身写的。
+    if let Some(bad) = paths
+        .iter()
+        .find(|p| !p.starts_with('/') && resolve_callback_path(p, &manifest.id).is_none())
+    {
+        report.fail(
+            "回调路径在本 IM 目录下",
+            format!("{bad} 不是合规的相对路径（每段只用字母、数字与 - _ .）"),
+        );
+    } else if paths.iter().all(|p| !p.starts_with('/')) {
+        report.pass("回调路径在本 IM 目录下");
+    } else if let Some(bad) = paths
+        .iter()
+        .find(|p| p.starts_with('/') && !callback_path_ok(p, &manifest.id))
+    {
+        report.fail(
+            "回调路径在本 IM 目录下",
+            format!(
+                "{bad} 是完整路径：改成相对路径（如 callback），宿主会拼在这个 IM 自己的目录下"
+            ),
+        );
+    } else {
+        report.skip(
+            "回调路径在本 IM 目录下",
+            format!(
+                "路径在 /hhh-friend-im/{}/ 下：只有带官方签名、用保留编号的插件这样写才算数；写成相对路径就不用管这个",
+                manifest.id
+            ),
+        );
+    }
+}
+
+/// 带一个括号的写法（正文表情写法、头像身份）的问题：编不过、或没有一个括号（第一个括号是 `group`）。按常用写法核对，
+/// 不支持前后断言等少见写法。
+fn pattern_problem(pattern: &str, group: &str) -> Option<String> {
+    if pattern.trim().is_empty() {
+        return Some("写法是空的".into());
+    }
+    match regex_lite::Regex::new(pattern) {
+        Err(e) => Some(format!("编不过：{e}")),
+        Ok(re) if re.captures_len() < 2 => Some(format!("要有一个括号，第一个括号是{group}")),
+        Ok(_) => None,
+    }
+}
+
+/// 契约 provider-protocol v12 的新方法：声明了就要能调。
+async fn check_v12_calls(
+    conn: &Arc<Connection>,
+    report: &mut Report,
+    caps: &Capabilities,
+    online: bool,
+) {
+    if !caps.conversations.recent_activity {
+        report.skip("会话发现能调", "没声明 conversations.recentActivity");
+    } else if !online {
+        report.skip("会话发现能调", "没登录，读不了");
+    } else {
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            - 86_400_000;
+        match call_t(
+            conn,
+            "conversations/recentActivity",
+            json!({ "sinceMs": since, "pagesMax": 1 }),
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(v) => {
+                match serde_json::from_value::<hhh_im_protocol::method::RecentActivityResult>(v) {
+                    Ok(r) if r.items.iter().all(|i| !i.conversation_id.is_empty()) => {
+                        report.pass("会话发现能调");
+                    }
+                    Ok(_) => report.fail("会话发现能调", "有一项没有会话编号"),
+                    Err(e) => report.fail("会话发现能调", format!("结果格式不对：{e}")),
+                }
+            }
+            Err(e) => report.fail("会话发现能调", e),
+        }
+    }
+    if caps.session.renew {
+        // 拿一份假凭据叫它续期：回成功或回错误都算能答，超时不算。
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            conn.call("session/renew", json!({ "credential": "hhh-im-check" })),
+        )
+        .await
+        {
+            Ok(_) => report.pass("续期能答"),
+            Err(_) => report.fail("续期能答", "超过 10 秒没有响应"),
+        }
+    } else {
+        report.skip("续期能答", "没声明 session.renew");
+    }
 }
 
 fn check_pushed_messages(report: &mut Report, events: &[Value]) {
@@ -567,6 +803,111 @@ fn resolve_command(dir: &std::path::Path, command: &str) -> String {
 }
 
 /// 估算一段 base64 解码后的字节数（忽略换行与填充）。
+#[cfg(test)]
+mod v12_tests {
+    use super::*;
+
+    fn manifest() -> Manifest {
+        serde_json::from_value(json!({
+            "manifestVersion": 1, "id": "sample", "name": "示例", "version": "0.1.0", "command": "p", "os": ["windows"]
+        }))
+        .unwrap()
+    }
+
+    fn rows(report: &Report) -> Vec<(String, &'static str)> {
+        report
+            .rows
+            .iter()
+            .map(|(name, st, _)| {
+                (
+                    name.clone(),
+                    match st {
+                        Status::Pass => "pass",
+                        Status::Fail => "fail",
+                        Status::Skip => "skip",
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn status_of(report: &Report, name: &str) -> &'static str {
+        rows(report)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map_or("missing", |(_, s)| s)
+    }
+
+    // 每项新检查一正一反（契约 provider-protocol v12）：没声明跳过，写对通过，写错失败。
+    #[test]
+    fn v12_declarations_pass_fail_and_skip() {
+        let desc = |extra: Value| -> PlatformDesc {
+            let mut base = json!({ "avatarShape": "rounded", "history": "none", "actions": {} });
+            for (k, v) in extra.as_object().unwrap() {
+                base[k] = v.clone();
+            }
+            serde_json::from_value(base).unwrap()
+        };
+        let mut report = Report::new();
+        check_v12_declarations(&mut report, &manifest(), &desc(json!({})), &json!({}));
+        for name in [
+            "开放的读取项认得出",
+            "按内容认编辑的取值认得出",
+            "重译规则名不重复",
+            "正文表情写法能编译",
+            "头像身份写法能编译",
+            "标志外框在画布内",
+            "登录方式写法对",
+            "回调路径在本 IM 目录下",
+        ] {
+            assert_eq!(status_of(&report, name), "skip", "{name}");
+        }
+
+        let good = desc(json!({
+            "userAdjustable": ["readIntervals", "readsPerMinute"], "editsByContent": ["text"],
+            "retranslateRules": [{ "name": "a" }, { "name": "b" }],
+            "emoji": { "unlisted": { "placeholderLabel": "表情" }, "textPattern": "\\{([^{}\\r\\n]{1,12})\\}" },
+            "avatarIdentity": { "keyPattern": "/(v3_[^/?#]+)", "variantPattern": "[?&]image_size=([^&#]+)" }
+        }));
+        let good_init = json!({ "loginMethods": [
+            { "id": "relay", "kind": "relay", "label": "中继" },
+            { "id": "own", "kind": "ownApp", "label": "自己的应用", "callbackPath": "callback" }
+        ] });
+        let mut marked = manifest();
+        marked.logo_ink =
+            serde_json::from_value(json!({ "x": 1, "y": 1, "width": 20, "height": 20 })).unwrap();
+        let mut report = Report::new();
+        check_v12_declarations(&mut report, &marked, &good, &good_init);
+        assert!(
+            rows(&report).iter().all(|(_, s)| *s == "pass"),
+            "{:?}",
+            rows(&report)
+        );
+
+        let bad = desc(json!({
+            "userAdjustable": ["readIntervals", "somethingNew"], "editsByContent": ["card"],
+            "retranslateRules": [{ "name": "a" }, { "name": "a" }],
+            "emoji": { "unlisted": { "placeholderLabel": "表情" }, "textPattern": "\\{[^}]+\\}" },
+            "avatarIdentity": { "keyPattern": "/v3_[^/?#]+" }
+        }));
+        let bad_init = json!({ "loginMethods": [
+            { "id": "x", "kind": "passkey", "label": "通行密钥" },
+            { "id": "own", "kind": "ownApp", "label": "自己的应用", "callbackPath": "/hhh-friend-im/feishu/callback" }
+        ] });
+        let mut broken = manifest();
+        broken.logo_ink =
+            serde_json::from_value(json!({ "x": 1, "y": 1, "width": 0, "height": 20 })).unwrap();
+        let mut report = Report::new();
+        check_v12_declarations(&mut report, &broken, &bad, &bad_init);
+        assert!(
+            rows(&report).iter().all(|(_, s)| *s == "fail"),
+            "{:?}",
+            rows(&report)
+        );
+        assert!(pattern_problem("(", "表情名").is_some(), "编不过");
+    }
+}
+
 fn base64_len(s: &str) -> usize {
     let clean: usize = s.chars().filter(|c| !c.is_whitespace()).count();
     let pad = s.chars().rev().take_while(|&c| c == '=').count();

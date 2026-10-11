@@ -3,7 +3,8 @@
 //!
 //! 用法：
 //! ```text
-//! hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--publish]
+//! hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--sign-key <私钥文件>] [--publish]
+//! hhh-im-pack keygen <放钥匙的文件夹>
 //! ```
 //! - `--target`：`windows-x64`、`macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64`；不写用这台电脑的目标。
 //! - `--out`：包与索引放哪，默认插件文件夹下的 `dist/`。
@@ -13,17 +14,21 @@
 //! - `--publish`：打好后发到清单 `source` 写的 GitHub / GitLab 仓库（见 [`publish`]）：标签默认 `v<清单版本>`，新版本要比
 //!   仓库里最新的正式版本大，仓库里同一版本已有的索引先合进来；令牌只从环境变量读（`HHH_IM_PUBLISH_TOKEN`，或
 //!   `GITHUB_TOKEN` / `GITLAB_TOKEN`）。
+//! - `--sign-key`：用这个私钥给写好的版本索引签名，写出 `hhhim-release.json.sig`，发布时一起上传（官方插件要，契约 v14 §2.5）。
+//! - `keygen`：生成一对签名钥匙（见 [`sign`]），已有同名文件时不覆盖。
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[path = "hhh_im_pack/publish.rs"]
 mod publish;
+#[path = "hhh_im_pack/sign.rs"]
+mod sign;
 
 use hhh_im_protocol::package;
 use hhh_im_protocol::release::{
-    INDEX_VERSION, LOGO_DATA_MAX_BYTES, NOTES_MAX_CHARS, RELEASE_INDEX_FILE, ReleaseIndex,
-    ReleasePackage, Target, Version,
+    INDEX_VERSION, LOGO_DATA_MAX_BYTES, NOTES_MAX_CHARS, RELEASE_INDEX_FILE,
+    RELEASE_SIGNATURE_FILE, ReleaseIndex, ReleasePackage, Target, Version,
 };
 
 struct Args {
@@ -33,11 +38,12 @@ struct Args {
     notes: Option<PathBuf>,
     tag: Option<String>,
     after: Option<String>,
+    sign_key: Option<PathBuf>,
     publish: bool,
 }
 
 fn usage() -> String {
-    "用法：hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--publish]".into()
+    "用法：hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--sign-key <私钥文件>] [--publish]\n      hhh-im-pack keygen <放钥匙的文件夹>".into()
 }
 
 fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -47,6 +53,7 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut notes = None;
     let mut tag = None;
     let mut after = None;
+    let mut sign_key = None;
     let mut publish = false;
     let mut raw = raw.peekable();
     while let Some(arg) = raw.next() {
@@ -63,6 +70,7 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             "--notes" => notes = Some(PathBuf::from(value("--notes")?)),
             "--tag" => tag = Some(value("--tag")?),
             "--after" => after = Some(value("--after")?),
+            "--sign-key" => sign_key = Some(PathBuf::from(value("--sign-key")?)),
             "--publish" => publish = true,
             "-h" | "--help" => return Err(usage()),
             other if other.starts_with("--") => {
@@ -88,6 +96,7 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         notes,
         tag,
         after,
+        sign_key,
         publish,
     })
 }
@@ -130,6 +139,8 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 fn run(args: Args) -> Result<String, String> {
+    // 私钥先读：读不了就不打包、不发布（别发出一个没签名的官方版本）。
+    let signing = args.sign_key.as_deref().map(sign::load).transpose()?;
     let packed = package::pack(&args.dir, args.target, &args.out).map_err(|error| error.0)?;
     let manifest = &packed.manifest;
     let version = Version::parse(&manifest.version).ok_or("清单版本号不是 主.次.修订。")?;
@@ -234,8 +245,18 @@ fn run(args: Args) -> Result<String, String> {
     index.check()?;
     let json =
         serde_json::to_string_pretty(&index).map_err(|error| format!("版本索引写不出：{error}"))?;
-    std::fs::write(&index_path, json + "\n")
+    let json = json + "\n";
+    std::fs::write(&index_path, &json)
         .map_err(|error| format!("版本索引写不进 {}：{error}", index_path.display()))?;
+    // 签名：签刚写下的这份字节（契约 v14 §2.5）；没给私钥时把旧的签名文件删掉，免得它对不上新索引。
+    let signature_path = args.out.join(RELEASE_SIGNATURE_FILE);
+    match &signing {
+        Some(key) => std::fs::write(&signature_path, sign::sign(key, json.as_bytes()) + "\n")
+            .map_err(|error| format!("签名写不进 {}：{error}", signature_path.display()))?,
+        None => {
+            let _ = std::fs::remove_file(&signature_path);
+        }
+    }
     let mut summary = format!(
         "已打包 {}（{} 字节，sha256 {}）\n版本索引 {}：{} {}，{} 个包",
         packed.path.display(),
@@ -246,19 +267,40 @@ fn run(args: Args) -> Result<String, String> {
         index.version,
         index.packages.len()
     );
+    if signing.is_some() {
+        summary.push_str(&format!("\n已签名 {}", signature_path.display()));
+    }
     if let Some(publisher) = publisher {
-        let page = publisher.upload(
-            &index.id,
-            &[packed.path.as_path(), index_path.as_path()],
-            &index.notes,
-        )?;
+        let mut files = vec![packed.path.as_path(), index_path.as_path()];
+        if signing.is_some() {
+            files.push(signature_path.as_path());
+        }
+        let page = publisher.upload(&index.id, &files, &index.notes)?;
         summary.push_str(&format!("\n已发布到 {page}"));
     }
     Ok(summary)
 }
 
+/// `keygen <文件夹>`：生成钥匙，告诉用户公钥与私钥放哪。
+fn keygen(dir: Option<String>) -> Result<String, String> {
+    let dir = dir.ok_or_else(usage)?;
+    let (private, public, public_hex) = sign::keygen(Path::new(&dir))?;
+    Ok(format!(
+        "已生成签名钥匙：\n私钥 {}（只放私有密钥仓库，不进任何公开仓库、聊天与日志）\n公钥 {}：{public_hex}",
+        private.display(),
+        public.display()
+    ))
+}
+
 fn main() -> ExitCode {
-    match parse_args(std::env::args().skip(1)).and_then(run) {
+    let mut raw = std::env::args().skip(1).peekable();
+    let result = if raw.peek().map(String::as_str) == Some("keygen") {
+        raw.next();
+        keygen(raw.next())
+    } else {
+        parse_args(raw).and_then(run)
+    };
+    match result {
         Ok(summary) => {
             println!("{summary}");
             ExitCode::SUCCESS
@@ -299,6 +341,57 @@ mod tests {
         let mut raw = vec![dir.display().to_string()];
         raw.extend(extra.iter().map(|s| s.to_string()));
         parse_args(raw.into_iter()).unwrap()
+    }
+
+    // 契约 provider-protocol v14 §2.5：给了私钥就给写下的那份索引签名（签名能用公钥验过），再打一次不给私钥时删掉旧签名；
+    // 私钥读不了时不打包。
+    #[test]
+    fn a_signing_key_signs_exactly_the_index_written() {
+        let dir = plugin("signed");
+        let keys = dir.0.join("keys");
+        let (private, _, public_hex) = sign::keygen(&keys).unwrap();
+        let summary = run(args(
+            &dir.0,
+            &[
+                "--target",
+                "windows-x64",
+                "--sign-key",
+                private.to_str().unwrap(),
+            ],
+        ))
+        .unwrap();
+        assert!(summary.contains("已签名"), "{summary}");
+        let index = std::fs::read(dir.0.join("dist").join(RELEASE_INDEX_FILE)).unwrap();
+        let signature =
+            std::fs::read_to_string(dir.0.join("dist").join(RELEASE_SIGNATURE_FILE)).unwrap();
+        let bytes: Vec<u8> = (0..64)
+            .map(|i| u8::from_str_radix(&signature.trim()[i * 2..i * 2 + 2], 16).unwrap())
+            .collect();
+        let public: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&public_hex[i * 2..i * 2 + 2], 16).unwrap())
+            .collect();
+        let verifying =
+            ed25519_dalek::VerifyingKey::from_bytes(&public.try_into().unwrap()).unwrap();
+        assert!(
+            verifying
+                .verify_strict(
+                    &index,
+                    &ed25519_dalek::Signature::from_slice(&bytes).unwrap()
+                )
+                .is_ok()
+        );
+
+        run(args(&dir.0, &["--target", "linux-x64"])).unwrap();
+        assert!(
+            !dir.0.join("dist").join(RELEASE_SIGNATURE_FILE).exists(),
+            "不签名时删掉对不上新索引的旧签名"
+        );
+        let missing = dir.0.join("keys").join("nope.key");
+        assert!(
+            run(args(&dir.0, &["--sign-key", missing.to_str().unwrap()]))
+                .unwrap_err()
+                .contains("读不了")
+        );
     }
 
     #[test]
