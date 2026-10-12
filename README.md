@@ -22,13 +22,13 @@
 
 ```toml
 [dependencies]
-hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.2.0", features = ["transport"] }
+hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.3.0", features = ["transport"] }
 ```
 
 装两个工具：
 
 ```sh
-cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.2.0 hhh-im-protocol --features transport,package
+cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.3.0 hhh-im-protocol --features transport,package
 ```
 
 - 自检：`hhh-im-check <插件文件夹>/hhh-im-provider.json`

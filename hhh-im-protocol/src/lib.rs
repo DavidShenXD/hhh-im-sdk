@@ -89,4 +89,20 @@ pub mod budget {
     pub const RETRANSLATE_RULES_MAX: usize = 32;
     /// 平台说明里的正则（表情写法）最长多少字节。
     pub const PATTERN_MAX_BYTES: usize = 1024;
+    /// 一个插件最多声明几项操作（契约 provider-protocol v13）；多出的不登记。
+    pub const ACTIONS_MAX: usize = 16;
+    /// 操作、提醒按钮的文字最多几个字（按字符数）。
+    pub const ACTION_LABEL_MAX_CHARS: usize = 20;
+    /// 出示文字一步的正文最多几个字（按字符数）。
+    pub const STEP_TEXT_MAX_CHARS: usize = 4096;
+    /// 列表一步最多几行。
+    pub const STEP_ROWS_MAX: usize = 200;
+    /// 一步里其余每段文字（说明、标题、细节、按钮文字、小标题与说明）最多几个字（按字符数）。
+    pub const STEP_PIECE_MAX_CHARS: usize = 200;
+    /// 一步最多几个“另一种做法”。
+    pub const STEP_LINKS_MAX: usize = 8;
+    /// 列表一行最多几颗按钮。
+    pub const ROW_ACTIONS_MAX: usize = 4;
+    /// 确认一步最多几段带小标题的说明。
+    pub const STEP_SECTIONS_MAX: usize = 16;
 }

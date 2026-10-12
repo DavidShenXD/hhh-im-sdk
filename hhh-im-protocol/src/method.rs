@@ -41,6 +41,21 @@ pub enum Method {
     LoginFailed,
     /// 把本机回调交给插件（宿主→插件，契约 provider-protocol v12 缺口 6）。
     LoginCallback,
+    // —— 插件操作（契约 provider-protocol v13）——
+    /// 开始一个插件声明的操作（宿主→插件）。
+    ActionsStart,
+    /// 操作的一步（插件→宿主通知）。
+    ActionStep,
+    /// 提交操作里的表单（宿主→插件通知）。
+    ActionSubmit,
+    /// 取消操作（宿主→插件通知）。
+    ActionCancel,
+    /// 操作做完（插件→宿主通知）。
+    ActionFinished,
+    /// 操作没做成（插件→宿主通知）。
+    ActionFailed,
+    /// 用户在一步里做了选择（宿主→插件通知；登录与操作共用）。
+    StepChoose,
     // —— 凭据与授权（插件→宿主）——
     /// 保存凭据（插件→宿主）。
     CredentialSave,
@@ -134,6 +149,13 @@ impl Method {
             Method::LoginFinished => "login/finished",
             Method::LoginFailed => "login/failed",
             Method::LoginCallback => "login/callback",
+            Method::ActionsStart => "actions/start",
+            Method::ActionStep => "action/step",
+            Method::ActionSubmit => "action/submit",
+            Method::ActionCancel => "action/cancel",
+            Method::ActionFinished => "action/finished",
+            Method::ActionFailed => "action/failed",
+            Method::StepChoose => "step/choose",
             Method::CredentialSave => "credential/save",
             Method::SessionExpired => "session/expired",
             Method::SessionNotice => "session/notice",
@@ -196,6 +218,13 @@ impl Method {
             Method::LoginFinished,
             Method::LoginFailed,
             Method::LoginCallback,
+            Method::ActionsStart,
+            Method::ActionStep,
+            Method::ActionSubmit,
+            Method::ActionCancel,
+            Method::ActionFinished,
+            Method::ActionFailed,
+            Method::StepChoose,
             Method::CredentialSave,
             Method::SessionExpired,
             Method::SessionNotice,
@@ -288,6 +317,57 @@ pub struct InitializeResult {
     /// 支持的登录方式，按显示顺序（契约 provider-protocol v12 缺口 6）；不写就是只有一种、点登录直接走插件推来的步骤。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub login_methods: Vec<LoginMethod>,
+    /// 插件的操作，按显示顺序（契约 provider-protocol v13）：账号级的进连接卡的“管理”菜单，会话级的进会话菜单；
+    /// 不写就没有。至多 [`crate::budget::ACTIONS_MAX`] 项。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionDecl>,
+}
+
+/// 插件声明的一项操作（`initialize.actions`，契约 provider-protocol v13）。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::method::{ActionDecl, ActionScope};
+/// use hhh_im_protocol::ConversationKind;
+/// let decl: ActionDecl = serde_json::from_value(serde_json::json!(
+///     { "id": "members", "label": "群成员", "scope": "conversation", "conversationKinds": ["group"] })).unwrap();
+/// assert_eq!(decl.scope, ActionScope::Conversation);
+/// assert!(decl.applies_to(ConversationKind::Group) && !decl.applies_to(ConversationKind::Direct));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionDecl {
+    /// 操作编号（插件内不重复；用户点了宿主照它叫 `actions/start`）。
+    pub id: String,
+    /// 菜单上的字（至多 [`crate::budget::ACTION_LABEL_MAX_CHARS`] 个字）。
+    pub label: String,
+    /// 放在哪个菜单。
+    pub scope: ActionScope,
+    /// 会话级操作只在这几种会话上有；不写就是每种会话都有。账号级操作不看它。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conversation_kinds: Vec<ConversationKind>,
+}
+
+impl ActionDecl {
+    /// 会话级操作适不适用于这种会话（没限定就都适用）。
+    pub fn applies_to(&self, kind: ConversationKind) -> bool {
+        self.scope == ActionScope::Conversation
+            && (self.conversation_kinds.is_empty() || self.conversation_kinds.contains(&kind))
+    }
+}
+
+/// 操作放在哪个菜单。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ActionScope {
+    /// 连接卡的“管理”菜单。
+    Account,
+    /// 会话菜单。
+    Conversation,
+    /// 宿主不认识的位置：这一项不登记。
+    #[serde(other)]
+    Unknown,
 }
 
 /// 插件信息。
@@ -414,6 +494,10 @@ pub enum LoginKind {
     OwnApp,
     /// 直接登录：不用填，照插件推来的步骤走。
     Direct,
+    /// 用宿主账号登录（契约 provider-protocol v13）：不用填，宿主在 `login/start` 里给当前宿主账号的令牌
+    /// （[`login_value::HOST_TOKEN`]）与账号（[`LoginStartParams::host_account`]）。只有宿主允许的插件（Friend：带官方签名）
+    /// 登记这一类；登记了、还没登录也没被用户手动退出过时，宿主在刚装好、启动、切到这个身份时自动开始。
+    Host,
     /// 宿主不认识的类型：这一种方式不登记。
     #[serde(other)]
     Unknown,
@@ -427,6 +511,22 @@ pub mod login_value {
     pub const APP_ID: &str = "appId";
     /// App Secret（`ownApp`）；只在用户这次填了时给，没填表示沿用插件凭据里的。
     pub const APP_SECRET: &str = "appSecret";
+    /// 宿主账号的访问令牌（`host`，契约 provider-protocol v13）：只在这次 `login/start` 里给一次，宿主不存、不进日志；
+    /// 插件要再用就自己存进凭据。
+    pub const HOST_TOKEN: &str = "hostToken";
+}
+
+/// 用宿主账号登录时宿主现在的账号（`login/start.hostAccount`，契约 provider-protocol v13），给插件在步骤里显示用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostAccount {
+    /// 名字。
+    pub name: String,
+    /// 一行说明：个人还是组织（如“个人”“组织 · XD”）。
+    pub detail: String,
+    /// 这个账号的头像地址（https）；没有就不给。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
 }
 
 /// 一种登录方式（`initialize.loginMethods`）：类型由 IM 层定，叫法、说明、灰字、链接由 IM 写。
@@ -541,7 +641,8 @@ pub fn resolve_callback_path(path: &str, platform_id: &str) -> Option<String> {
 }
 
 /// `login/start` 参数（契约 provider-protocol v12 缺口 6）。旧宿主发 `{}`，旧插件忽略多出的字段。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// 填的内容里有 App Secret、宿主令牌，`Debug` 不打印它们。
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginStartParams {
     /// 这次选的登录方式编号（插件声明了 `loginMethods` 时给）。
@@ -556,6 +657,22 @@ pub struct LoginStartParams {
     /// 一次性的 `state`：插件放进授权地址，回调带回来时宿主核对（给了 `callbackUrl` 时给）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// 用宿主账号登录（`host`，契约 provider-protocol v13）时宿主现在的账号；令牌在 `values` 的
+    /// [`login_value::HOST_TOKEN`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_account: Option<HostAccount>,
+}
+
+impl std::fmt::Debug for LoginStartParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginStartParams")
+            .field("method", &self.method)
+            .field("values", &self.values.keys().collect::<Vec<_>>())
+            .field("callback_url", &self.callback_url)
+            .field("has_state", &self.state.is_some())
+            .field("host_account", &self.host_account)
+            .finish()
+    }
 }
 
 /// `login/callback` 参数（宿主→插件）：宿主在本机收到这次登录的回调、`state` 对上了，把整个地址交给插件。
@@ -586,7 +703,24 @@ pub struct LoginStepParams {
     pub step: LoginStep,
 }
 
-/// 登录步骤（protocol-v1 §7 登录表）。
+/// 登录与插件操作共用的一步（protocol-v1 §6.1 步骤表；`showText`、`list`、`confirm` 与 `links` 是契约
+/// provider-protocol v13 加的）。
+///
+/// 用户在一步里的选择——点了“另一种做法”（`links`）、列表行尾的按钮、多选或确认一步的确认、出示文字的确认、
+/// 左边按钮代表的选择（`cancelChoice`）——宿主一律发 `step/choose`（[`StepChooseParams`]）。`noCancel` 的一步没有左边的
+/// 取消按钮，点遮罩、按 Esc 都不关（不能跳过）。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::method::{LoginStep, TextLayout};
+/// let step: LoginStep = serde_json::from_value(serde_json::json!({
+///     "kind": "showText", "caption": "这是你的恢复密钥", "text": "a b c", "layout": "words",
+///     "copy": true, "ack": "我已保存", "confirmLabel": "完成", "noCancel": true })).unwrap();
+/// let LoginStep::ShowText { layout, no_cancel, .. } = step else { panic!() };
+/// assert_eq!(layout, TextLayout::Words);
+/// assert!(no_cancel);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -606,6 +740,9 @@ pub enum LoginStep {
         /// 插件声明的提示（契约 provider-protocol v8）：画在这一步内容下面、按钮上面；不给就没有。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<LoginNote>,
+        /// 另一种做法（v13）：按钮下方居中的文字按钮。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links: Vec<StepLink>,
     },
     /// 打开浏览器。
     OpenUrl {
@@ -616,6 +753,9 @@ pub enum LoginStep {
         /// 插件声明的提示（契约 provider-protocol v8）：画在这一步内容下面、按钮上面；不给就没有。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<LoginNote>,
+        /// 另一种做法（v13）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links: Vec<StepLink>,
     },
     /// 等待设备确认。
     ConfirmOnDevice {
@@ -624,14 +764,35 @@ pub enum LoginStep {
         /// 插件声明的提示（契约 provider-protocol v8）：画在这一步内容下面、按钮上面；不给就没有。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<LoginNote>,
+        /// 另一种做法（v13）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links: Vec<StepLink>,
     },
-    /// 表单。
+    /// 表单。提交时宿主调 `login/submit` 或 `action/submit`。
     Input {
         /// 字段。
         fields: Vec<LoginField>,
         /// 插件声明的提示（契约 provider-protocol v8）：画在这一步内容下面、按钮上面；不给就没有。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<LoginNote>,
+        /// 字段上面的一句说明（v13）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        /// 提交按钮的文字（v13）；不给写“提交”。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submit_label: Option<String>,
+        /// 左边按钮的文字（v13）；不给写“取消”。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_label: Option<String>,
+        /// 左边按钮代表的选择（v13，如批准框的“拒绝”）：给了点它发 `step/choose`，不是取消。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_choice: Option<String>,
+        /// 没有左边的按钮、不能跳过（v13）。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_cancel: bool,
+        /// 另一种做法（v13）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links: Vec<StepLink>,
     },
     /// 一段说明（本身就是提示，不再带 `note`）。
     Message {
@@ -639,7 +800,398 @@ pub enum LoginStep {
         text: String,
         /// 色调。
         tone: MessageTone,
+        /// 另一种做法（v13）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links: Vec<StepLink>,
     },
+    /// 出示一段要保存或要对照的文字（v13）：恢复密钥、新电脑上的几个词、好友链接。
+    ShowText {
+        /// 文字上面的一句说明。
+        caption: String,
+        /// 正文（至多 [`crate::budget::STEP_TEXT_MAX_CHARS`] 个字）。
+        text: String,
+        /// 排法。
+        layout: TextLayout,
+        /// 有没有“复制”。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        copy: bool,
+        /// “我已保存”这类勾选：给了就要先勾上才能点确认。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<String>,
+        /// 确认按钮的文字（点了发 `step/choose {choice: "confirm"}`）；不给就没有确认按钮。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirm_label: Option<String>,
+        /// 左边按钮的文字；不给时有确认写“取消”、没确认写“关闭”。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_label: Option<String>,
+        /// 左边按钮代表的选择：给了点它发 `step/choose`，不是取消。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_choice: Option<String>,
+        /// 没有左边的按钮、不能跳过。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_cancel: bool,
+        /// 给了就在文字下面转圈等，写这句话（如“等待批准…”）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        waiting: Option<String>,
+        /// 插件声明的提示。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<LoginNote>,
+        /// 另一种做法。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links: Vec<StepLink>,
+    },
+    /// 一列东西（v13）：每行可带按钮（我的电脑、群成员），或多选后确认（选好友）。
+    List {
+        /// 列表上面的一句说明。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        /// 行（至多 [`crate::budget::STEP_ROWS_MAX`] 行）。
+        rows: Vec<ListRow>,
+        /// 给了就是多选。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<ListSelect>,
+        /// 一行都没有时写什么。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        empty: Option<String>,
+        /// 左边按钮的文字；不给时多选写“取消”、否则写“关闭”。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_label: Option<String>,
+        /// 左边按钮代表的选择：给了点它发 `step/choose`，不是取消。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_choice: Option<String>,
+        /// 没有左边的按钮、不能跳过。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_cancel: bool,
+        /// 插件声明的提示。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<LoginNote>,
+        /// 另一种做法。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links: Vec<StepLink>,
+    },
+    /// 确认或说明（v13）：可带一个人、几段带小标题的说明；不可撤销的操作用危险色。
+    Confirm {
+        /// 粗体的一句话（如“移除「办公室电脑」？”）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        /// 要核对的人。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        person: Option<StepPerson>,
+        /// 几段带小标题的说明。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sections: Vec<StepSection>,
+        /// 一段说明。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// 确认按钮的文字（点了发 `step/choose {choice: "confirm"}`）。
+        confirm_label: String,
+        /// 危险操作：确认按钮用危险色。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        danger: bool,
+        /// 左边按钮的文字；不给写“取消”。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_label: Option<String>,
+        /// 左边按钮代表的选择：给了点它发 `step/choose`，不是取消。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_choice: Option<String>,
+        /// 没有左边的按钮、不能跳过。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_cancel: bool,
+        /// 插件声明的提示。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<LoginNote>,
+        /// 另一种做法。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links: Vec<StepLink>,
+    },
+}
+
+/// 一步里“另一种做法”（v13）：按钮下方居中的文字按钮，点了宿主发 `step/choose {choice: id}`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepLink {
+    /// 选择编号。
+    pub id: String,
+    /// 按钮文字。
+    pub label: String,
+}
+
+/// 出示文字的排法（v13）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextLayout {
+    /// 按空白分开的词，逐个编号（恢复密钥）。
+    Words,
+    /// 一行大字（新电脑上的几个词）。
+    Code,
+    /// 一行等宽（链接）。
+    Line,
+    /// 宿主不认识的排法：按一行等宽画。
+    #[serde(other)]
+    Unknown,
+}
+
+/// 列表的一行（v13）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListRow {
+    /// 行编号（点了行尾按钮、多选确认时交回）。
+    pub id: String,
+    /// 标题。
+    pub title: String,
+    /// 一行细节。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// 标题后的小角标（如“本机”“群主”）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// 行首的图标；不给就没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<RowIcon>,
+    /// 行尾的按钮（点了发 `step/choose {choice: 按钮编号, row: 行编号}`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<RowAction>,
+}
+
+/// 行首的图标（v13）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RowIcon {
+    /// 一个人：圆标里画标题的第一个字。
+    Person,
+    /// 一台电脑。
+    Device,
+    /// 宿主不认识的图标：不画。
+    #[serde(other)]
+    Unknown,
+}
+
+/// 行尾的一颗按钮（v13）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RowAction {
+    /// 选择编号。
+    pub id: String,
+    /// 按钮文字。
+    pub label: String,
+    /// 不可撤销：用危险色。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub danger: bool,
+}
+
+/// 列表的多选（v13）：选好后点确认，宿主发 `step/choose {choice: "confirm", selected: [行编号…]}`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSelect {
+    /// 至少选几行（不给按 1）。
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub min: u32,
+    /// 至多选几行；不给不限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u32>,
+    /// 确认按钮的文字。
+    pub confirm_label: String,
+}
+
+fn one() -> u32 {
+    1
+}
+
+fn is_one(value: &u32) -> bool {
+    *value == 1
+}
+
+/// 确认一步里要核对的人（v13）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepPerson {
+    /// 名字。
+    pub name: String,
+    /// 一行细节（如身份指纹）。
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// 确认一步里一段带小标题的说明（v13）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepSection {
+    /// 小标题。
+    pub title: String,
+    /// 正文。
+    pub text: String,
+}
+
+/// `step/choose` 参数（宿主→插件通知，v13；登录与操作共用，同 `login/submit`）：用户在这一步做了选择。插件之后照常推下一步或结束。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepChooseParams {
+    /// 流程编号（登录或操作的）。
+    pub flow_id: String,
+    /// 选择编号：`confirm`（确认）、`links` 里的编号、行尾按钮的编号或 `cancelChoice`。
+    pub choice: String,
+    /// 点的是哪一行的按钮。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<String>,
+    /// 多选确认时选中的行。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected: Vec<String>,
+}
+
+/// 一项操作声明哪里不合要求（v13，宿主与自检工具共用）：位置认不出、编号不合编号规则、文字是空的或超过
+/// [`ACTION_LABEL_MAX_CHARS`](crate::budget::ACTION_LABEL_MAX_CHARS) 个字。编号重复与项数上限由调用方按整张表核对。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::method::{action_problem, ActionDecl, ActionScope};
+/// let decl = |id: &str, label: &str| ActionDecl {
+///     id: id.into(), label: label.into(), scope: ActionScope::Account, conversation_kinds: vec![] };
+/// assert_eq!(action_problem(&decl("devices", "我的电脑")), None);
+/// assert!(action_problem(&decl("", "我的电脑")).is_some());
+/// assert!(action_problem(&decl("devices", "  ")).is_some());
+/// assert!(action_problem(&decl("devices", &"字".repeat(21))).is_some());
+/// ```
+pub fn action_problem(decl: &ActionDecl) -> Option<&'static str> {
+    use crate::budget::ACTION_LABEL_MAX_CHARS;
+    if decl.scope == ActionScope::Unknown {
+        Some("放在哪个菜单认不出")
+    } else if !crate::platform::Manifest::id_ok(&format!("a{}", decl.id)) || decl.id.is_empty() {
+        Some("编号是空的或写法不对")
+    } else if decl.label.trim().is_empty() || decl.label.chars().count() > ACTION_LABEL_MAX_CHARS {
+        Some("文字是空的或太长")
+    } else {
+        None
+    }
+}
+
+/// 一步哪里超出宿主的上限（v13，宿主与自检工具共用）：正文超过
+/// [`STEP_TEXT_MAX_CHARS`](crate::budget::STEP_TEXT_MAX_CHARS)、列表超过 [`STEP_ROWS_MAX`](crate::budget::STEP_ROWS_MAX)
+/// 行、其余每段文字超过 [`STEP_PIECE_MAX_CHARS`](crate::budget::STEP_PIECE_MAX_CHARS) 个字、按钮与说明段数超限、编号空着
+/// 或重复、多选的至少至多不成立。只核对 v13 加的内容（新的三种步骤、`links` 与表单的补充），旧步骤其余部分照旧。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::method::{step_problem, LoginStep};
+/// let step = |v: serde_json::Value| serde_json::from_value::<LoginStep>(v).unwrap();
+/// assert_eq!(step_problem(&step(serde_json::json!({ "kind": "list", "rows": [{ "id": "a", "title": "甲" }] }))), None);
+/// assert!(step_problem(&step(serde_json::json!({ "kind": "list",
+///     "rows": [{ "id": "a", "title": "甲" }, { "id": "a", "title": "乙" }] }))).is_some());
+/// assert!(step_problem(&step(serde_json::json!({ "kind": "showText", "caption": "密钥",
+///     "text": "x".repeat(4097), "layout": "line" }))).is_some());
+/// ```
+pub fn step_problem(step: &LoginStep) -> Option<&'static str> {
+    use crate::budget::{
+        ROW_ACTIONS_MAX, STEP_LINKS_MAX, STEP_PIECE_MAX_CHARS, STEP_ROWS_MAX, STEP_SECTIONS_MAX,
+        STEP_TEXT_MAX_CHARS,
+    };
+    let piece = |text: &str| text.chars().count() <= STEP_PIECE_MAX_CHARS;
+    let piece_opt = |text: &Option<String>| text.as_deref().is_none_or(piece);
+    let filled = |text: &str| !text.trim().is_empty() && piece(text);
+    let links_ok = |links: &[StepLink]| {
+        links.len() <= STEP_LINKS_MAX
+            && links
+                .iter()
+                .all(|link| !link.id.is_empty() && piece(&link.id) && filled(&link.label))
+    };
+    let common_ok =
+        |links: &[StepLink], cancel_label: &Option<String>, cancel_choice: &Option<String>| {
+            links_ok(links)
+                && piece_opt(cancel_label)
+                && cancel_choice
+                    .as_deref()
+                    .is_none_or(|choice| !choice.is_empty() && piece(choice))
+        };
+    let ok = match step {
+        LoginStep::QrCode { links, .. }
+        | LoginStep::OpenUrl { links, .. }
+        | LoginStep::ConfirmOnDevice { links, .. }
+        | LoginStep::Message { links, .. } => links_ok(links),
+        LoginStep::Input {
+            caption,
+            submit_label,
+            cancel_label,
+            cancel_choice,
+            links,
+            ..
+        } => {
+            piece_opt(caption)
+                && piece_opt(submit_label)
+                && common_ok(links, cancel_label, cancel_choice)
+        }
+        LoginStep::ShowText {
+            caption,
+            text,
+            ack,
+            confirm_label,
+            cancel_label,
+            cancel_choice,
+            waiting,
+            links,
+            ..
+        } => {
+            piece(caption)
+                && !text.trim().is_empty()
+                && text.chars().count() <= STEP_TEXT_MAX_CHARS
+                && [ack, confirm_label, waiting].into_iter().all(piece_opt)
+                && common_ok(links, cancel_label, cancel_choice)
+        }
+        LoginStep::List {
+            caption,
+            rows,
+            select,
+            empty,
+            cancel_label,
+            cancel_choice,
+            links,
+            ..
+        } => {
+            let mut ids = std::collections::HashSet::new();
+            rows.len() <= STEP_ROWS_MAX
+                && rows.iter().all(|row| {
+                    !row.id.is_empty()
+                        && piece(&row.id)
+                        && ids.insert(row.id.as_str())
+                        && filled(&row.title)
+                        && piece_opt(&row.detail)
+                        && piece_opt(&row.tag)
+                        && row.actions.len() <= ROW_ACTIONS_MAX
+                        && row
+                            .actions
+                            .iter()
+                            .all(|a| !a.id.is_empty() && piece(&a.id) && filled(&a.label))
+                })
+                && select.as_ref().is_none_or(|s| {
+                    filled(&s.confirm_label) && s.max.is_none_or(|max| max >= 1 && max >= s.min)
+                })
+                && piece_opt(caption)
+                && piece_opt(empty)
+                && common_ok(links, cancel_label, cancel_choice)
+        }
+        LoginStep::Confirm {
+            caption,
+            person,
+            sections,
+            text,
+            confirm_label,
+            cancel_label,
+            cancel_choice,
+            links,
+            ..
+        } => {
+            filled(confirm_label)
+                && piece_opt(caption)
+                && piece_opt(text)
+                && person
+                    .as_ref()
+                    .is_none_or(|p| filled(&p.name) && piece(&p.detail))
+                && sections.len() <= STEP_SECTIONS_MAX
+                && sections.iter().all(|s| filled(&s.title) && filled(&s.text))
+                && common_ok(links, cancel_label, cancel_choice)
+        }
+    };
+    (!ok).then_some("这一步的文字、行或按钮超出上限，或编号空着、重复")
 }
 
 /// 登录表单字段。
@@ -708,6 +1260,12 @@ pub struct LoginFinishedParams {
     pub flow_id: String,
     /// 核验账号。
     pub account: Account,
+    /// 登录框开着时成功页的标题（v13）；不给写“<名字>已登录”。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 成功页的一段话（v13）；不给写“开始同步会话。”。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// `login/failed` 通知参数。
@@ -721,6 +1279,98 @@ pub struct LoginFailedParams {
     /// 能不能重试。
     #[serde(default)]
     pub retryable: bool,
+    /// 失败页的标题（v13）；不给写“登录没完成”。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 能重试时重试按钮的文字（v13）；不给写“重新登录”。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_label: Option<String>,
+}
+
+// ============================ 插件操作（契约 provider-protocol v13） ============================
+
+/// `actions/start` 参数（宿主→插件）：用户点了一项操作。插件回 [`ActionsStartResult`]，之后发 `action/step` 一步步走，
+/// 以 `action/finished` 或 `action/failed` 结束。新的 `actions/start` 或 `login/start` 取消还没结束的旧流程。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionsStartParams {
+    /// 操作编号：`initialize.actions` 里的，或提醒的 `action.id`（不必出现在 `actions` 里）。
+    pub action_id: String,
+    /// 会话级操作作用在哪个会话（平台会话编号）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+}
+
+/// `actions/start` 结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionsStartResult {
+    /// 这次操作的流程编号。
+    pub flow_id: String,
+    /// 对话框的标题（如提醒上的“查看”点开后写“批准新电脑”）；不给时宿主用操作的名字（会话级的写“操作名 · 会话名”）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// `action/step` 通知参数（插件→宿主）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionStepParams {
+    /// 流程编号。
+    pub flow_id: String,
+    /// 这一步要显示什么（与登录同一套）。
+    pub step: LoginStep,
+}
+
+/// `action/submit` 参数（宿主→插件通知）：表单一步提交。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionSubmitParams {
+    /// 流程编号。
+    pub flow_id: String,
+    /// 表单值。
+    pub values: std::collections::BTreeMap<String, String>,
+}
+
+/// `action/cancel` 参数（宿主→插件通知）：用户关掉了对话框。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionCancelParams {
+    /// 流程编号。
+    pub flow_id: String,
+}
+
+/// `action/finished` 通知参数（插件→宿主）。给了 `title` 或 `message` 时对话框换成成功页，都不给就直接关掉。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionFinishedParams {
+    /// 流程编号。
+    pub flow_id: String,
+    /// 成功页的标题。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 成功页的一段话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `action/failed` 通知参数（插件→宿主）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionFailedParams {
+    /// 流程编号。
+    pub flow_id: String,
+    /// 给用户看的说明。
+    pub message: String,
+    /// 能不能重试（重试 = 再开始一次这项操作）。
+    #[serde(default)]
+    pub retryable: bool,
+    /// 失败页的标题；不给写“没有完成”。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 重试按钮的文字；不给写“再试一次”。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_label: Option<String>,
 }
 
 // ============================ 凭据与授权 ============================
@@ -764,6 +1414,24 @@ pub struct Notice {
     /// 要重新登录才能好：卡片右边多一颗“重新登录”。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub relogin: bool,
+    /// 请用户处理的一件事（v13）：这一行画成待处理行（品牌黄），右边一颗按钮写 `label`，点了宿主叫
+    /// `actions/start {actionId: id}`（这个编号不必出现在 `initialize.actions` 里）。处理完、作废了，插件在下一次
+    /// `session/notice` 里去掉这一条。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<NoticeAction>,
+    /// 要立刻请用户看（v13）：带 `action` 的新提醒出现时，宿主窗口在前台、也没有别的对话框开着，就直接开始这个操作。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prompt: bool,
+}
+
+/// 提醒上的处理按钮（v13）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoticeAction {
+    /// 操作编号。
+    pub id: String,
+    /// 按钮文字（至多 [`crate::budget::ACTION_LABEL_MAX_CHARS`] 个字）。
+    pub label: String,
 }
 
 /// `session/expired` 通知参数。
@@ -1420,6 +2088,7 @@ mod tests {
             expires_at_ms: 1,
             hint: Some("扫码".into()),
             note: None,
+            links: vec![],
         };
         let v = serde_json::to_value(&step).unwrap();
         assert_eq!(v["kind"], "qrCode");
@@ -1463,5 +2132,252 @@ mod tests {
         let warn: LoginNote =
             serde_json::from_value(json!({ "text": "注意", "tone": "warn" })).unwrap();
         assert_eq!(warn.tone, MessageTone::Warn);
+    }
+
+    // 契约 provider-protocol v13：新方法名原样往返。
+    #[test]
+    fn v13_method_names_round_trip() {
+        for (m, name) in [
+            (Method::ActionsStart, "actions/start"),
+            (Method::ActionStep, "action/step"),
+            (Method::ActionSubmit, "action/submit"),
+            (Method::ActionCancel, "action/cancel"),
+            (Method::ActionFinished, "action/finished"),
+            (Method::ActionFailed, "action/failed"),
+            (Method::StepChoose, "step/choose"),
+        ] {
+            assert_eq!(m.as_str(), name);
+            assert_eq!(Method::from_name(name), Some(m));
+        }
+    }
+
+    // 契约 provider-protocol v13：用宿主账号登录、操作声明、提醒的处理按钮、成败页的文字都可选——旧形状照读、
+    // 写回不多出键；新形状原样往返；不认识的位置读成 Unknown。
+    #[test]
+    fn v13_host_login_actions_and_notice_fields_are_optional_and_round_trip() {
+        use serde_json::json;
+        let host: LoginMethod = serde_json::from_value(
+            json!({ "id": "cindy", "kind": "host", "label": "用 Cindy 账号登录" }),
+        )
+        .unwrap();
+        assert_eq!(host.kind, LoginKind::Host);
+
+        let start = json!({ "method": "cindy", "values": { "hostToken": "tok" },
+            "hostAccount": { "name": "李子", "detail": "个人", "avatarUrl": "https://example.com/a.png" } });
+        let parsed: LoginStartParams = serde_json::from_value(start.clone()).unwrap();
+        assert_eq!(parsed.values[login_value::HOST_TOKEN], "tok");
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), start);
+        let shown = format!("{parsed:?}");
+        assert!(!shown.contains("tok\""), "Debug 不打印令牌：{shown}");
+        let no_avatar: HostAccount =
+            serde_json::from_value(json!({ "name": "XD", "detail": "组织" })).unwrap();
+        assert!(no_avatar.avatar_url.is_none());
+        assert_eq!(
+            serde_json::to_value(&no_avatar).unwrap(),
+            json!({ "name": "XD", "detail": "组织" })
+        );
+
+        let decls = json!([
+            { "id": "devices", "label": "我的电脑", "scope": "account" },
+            { "id": "members", "label": "群成员", "scope": "conversation", "conversationKinds": ["group"] }
+        ]);
+        let parsed: Vec<ActionDecl> = serde_json::from_value(decls.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), decls);
+        assert!(
+            !parsed[0].applies_to(ConversationKind::Group),
+            "账号级不进会话菜单"
+        );
+        assert!(parsed[1].applies_to(ConversationKind::Group));
+        assert!(!parsed[1].applies_to(ConversationKind::Direct));
+        let odd: ActionDecl =
+            serde_json::from_value(json!({ "id": "x", "label": "X", "scope": "toolbar" })).unwrap();
+        assert_eq!(odd.scope, ActionScope::Unknown);
+
+        // 提醒：旧形状不多出键；带处理按钮与 prompt 的原样往返。
+        let plain = json!({ "id": "scope", "text": "缺少权限" });
+        let notice: Notice = serde_json::from_value(plain.clone()).unwrap();
+        assert!(notice.action.is_none() && !notice.prompt);
+        assert_eq!(serde_json::to_value(&notice).unwrap(), plain);
+        let ask = json!({ "id": "approve-1", "text": "新电脑「Mac」等你批准",
+            "action": { "id": "approve:1", "label": "查看" }, "prompt": true });
+        let notice: Notice = serde_json::from_value(ask.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&notice).unwrap(), ask);
+
+        // 成败页的文字可选。
+        let finished: LoginFinishedParams = serde_json::from_value(
+            json!({ "flowId": "f", "account": { "id": "u", "name": "我" } }),
+        )
+        .unwrap();
+        assert!(finished.title.is_none() && finished.message.is_none());
+        let failed = json!({ "flowId": "f", "message": "那台电脑拒绝了", "retryable": true,
+            "title": "没有批准", "retryLabel": "重新请求" });
+        let parsed: LoginFailedParams = serde_json::from_value(failed.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), failed);
+        let action_failed: ActionFailedParams = serde_json::from_value(failed.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&action_failed).unwrap(), failed);
+        let done: ActionFinishedParams = serde_json::from_value(json!({ "flowId": "f" })).unwrap();
+        assert_eq!(
+            serde_json::to_value(&done).unwrap(),
+            json!({ "flowId": "f" })
+        );
+
+        // actions/start 与 step/choose。
+        let start = json!({ "actionId": "members", "conversationId": "g1" });
+        let parsed: ActionsStartParams = serde_json::from_value(start.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), start);
+        let choose = json!({ "flowId": "f", "choice": "confirm", "selected": ["wang", "chen"] });
+        let parsed: StepChooseParams = serde_json::from_value(choose.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), choose);
+        let row = json!({ "flowId": "f", "choice": "remove", "row": "mac" });
+        let parsed: StepChooseParams = serde_json::from_value(row.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), row);
+    }
+
+    // 契约 provider-protocol v13：三种新步骤与各步的补充原样往返；旧步骤不带新字段时写回不多出键。
+    #[test]
+    fn v13_steps_round_trip_and_old_steps_stay_the_same() {
+        use serde_json::json;
+        for shape in [
+            json!({ "kind": "showText", "caption": "恢复密钥", "text": "a b c", "layout": "words", "copy": true,
+                "ack": "我已保存", "confirmLabel": "完成", "noCancel": true,
+                "note": { "text": "别发给任何人", "tone": "warn" } }),
+            json!({ "kind": "showText", "caption": "输入下面 4 个词", "text": "w x y z", "layout": "code",
+                "cancelLabel": "取消", "waiting": "等待批准…", "links": [{ "id": "useKey", "label": "改用恢复密钥" }] }),
+            json!({ "kind": "list", "caption": "登录着的电脑", "rows": [
+                { "id": "home", "title": "台式机", "detail": "在线", "tag": "本机", "icon": "device" },
+                { "id": "mac", "title": "MacBook", "icon": "device", "actions": [{ "id": "remove", "label": "移除", "danger": true }] }
+              ], "links": [{ "id": "regen", "label": "重新生成恢复密钥" }] }),
+            json!({ "kind": "list", "rows": [{ "id": "wang", "title": "王小明", "icon": "person" }],
+                "select": { "min": 2, "max": 9, "confirmLabel": "创建" }, "empty": "还没有好友。" }),
+            json!({ "kind": "confirm", "person": { "name": "王小明", "detail": "指纹 3F2A" },
+                "caption": "加王小明为好友？", "confirmLabel": "加好友" }),
+            json!({ "kind": "confirm", "sections": [{ "title": "服务器看不到", "text": "消息" }],
+                "confirmLabel": "知道了", "noCancel": true }),
+            json!({ "kind": "confirm", "caption": "移除？", "text": "那台电脑会退出。", "confirmLabel": "移除", "danger": true }),
+            json!({ "kind": "input", "fields": [{ "id": "words", "label": "4 个词", "secret": false }],
+                "caption": "新电脑想登录", "submitLabel": "批准", "cancelLabel": "拒绝", "cancelChoice": "reject" }),
+            json!({ "kind": "message", "text": "正在核对…", "tone": "info", "links": [{ "id": "back", "label": "返回" }] }),
+        ] {
+            let step: LoginStep = serde_json::from_value(shape.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&step).unwrap(),
+                shape,
+                "原样往返：{shape}"
+            );
+            assert_eq!(step_problem(&step), None, "在上限以内：{shape}");
+        }
+        // 多选的 min 不写按 1、写回不多出。
+        let step: LoginStep = serde_json::from_value(json!({ "kind": "list", "rows": [],
+            "select": { "confirmLabel": "邀请" } }))
+        .unwrap();
+        let LoginStep::List {
+            select: Some(select),
+            ..
+        } = &step
+        else {
+            panic!("应当是多选列表")
+        };
+        assert_eq!(select.min, 1);
+        assert_eq!(
+            serde_json::to_value(&step).unwrap()["select"],
+            json!({ "confirmLabel": "邀请" })
+        );
+        // 不认识的排法、图标读成 Unknown，不让这一步读不出。
+        let step: LoginStep =
+            serde_json::from_value(json!({ "kind": "showText", "caption": "c", "text": "t",
+            "layout": "grid" }))
+            .unwrap();
+        assert!(matches!(
+            step,
+            LoginStep::ShowText {
+                layout: TextLayout::Unknown,
+                ..
+            }
+        ));
+        let old = json!({ "kind": "input", "fields": [{ "id": "code", "label": "验证码", "secret": false }] });
+        let step: LoginStep = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&step).unwrap(), old, "旧表单不多出键");
+    }
+
+    // 契约 provider-protocol v13 §14：超出上限、编号空着或重复的一步不合要求。
+    #[test]
+    fn v13_steps_over_the_limits_are_refused() {
+        use crate::budget::{
+            STEP_LINKS_MAX, STEP_PIECE_MAX_CHARS, STEP_ROWS_MAX, STEP_TEXT_MAX_CHARS,
+        };
+        use serde_json::json;
+        let step = |v: serde_json::Value| serde_json::from_value::<LoginStep>(v).unwrap();
+        let long = "字".repeat(STEP_PIECE_MAX_CHARS + 1);
+        let at_limit = "字".repeat(STEP_PIECE_MAX_CHARS);
+        let rows = |n: usize| {
+            (0..n)
+                .map(|i| json!({ "id": format!("r{i}"), "title": "行" }))
+                .collect::<Vec<_>>()
+        };
+        let links = |n: usize| {
+            (0..n)
+                .map(|i| json!({ "id": format!("l{i}"), "label": "做法" }))
+                .collect::<Vec<_>>()
+        };
+        for (fine, shape) in [
+            (
+                true,
+                json!({ "kind": "showText", "caption": at_limit, "text": "x".repeat(STEP_TEXT_MAX_CHARS), "layout": "line" }),
+            ),
+            (
+                false,
+                json!({ "kind": "showText", "caption": "c", "text": "x".repeat(STEP_TEXT_MAX_CHARS + 1), "layout": "line" }),
+            ),
+            (
+                false,
+                json!({ "kind": "showText", "caption": "c", "text": "  ", "layout": "line" }),
+            ),
+            (
+                false,
+                json!({ "kind": "showText", "caption": long, "text": "t", "layout": "line" }),
+            ),
+            (true, json!({ "kind": "list", "rows": rows(STEP_ROWS_MAX) })),
+            (
+                false,
+                json!({ "kind": "list", "rows": rows(STEP_ROWS_MAX + 1) }),
+            ),
+            (
+                false,
+                json!({ "kind": "list", "rows": [{ "id": "", "title": "行" }] }),
+            ),
+            (
+                false,
+                json!({ "kind": "list", "rows": [{ "id": "a", "title": "行", "actions": [
+                { "id": "x", "label": "1" }, { "id": "x", "label": "2" }, { "id": "x", "label": "3" },
+                { "id": "x", "label": "4" }, { "id": "x", "label": "5" }] }] }),
+            ),
+            (
+                false,
+                json!({ "kind": "list", "rows": [], "select": { "min": 3, "max": 2, "confirmLabel": "选" } }),
+            ),
+            (false, json!({ "kind": "confirm", "confirmLabel": " " })),
+            (
+                false,
+                json!({ "kind": "confirm", "confirmLabel": "好", "sections": [{ "title": "t", "text": long }] }),
+            ),
+            (
+                true,
+                json!({ "kind": "message", "text": "等", "tone": "info", "links": links(STEP_LINKS_MAX) }),
+            ),
+            (
+                false,
+                json!({ "kind": "message", "text": "等", "tone": "info", "links": links(STEP_LINKS_MAX + 1) }),
+            ),
+            (
+                false,
+                json!({ "kind": "input", "fields": [], "cancelChoice": "" }),
+            ),
+        ] {
+            assert_eq!(
+                step_problem(&step(shape.clone())).is_none(),
+                fine,
+                "{shape}"
+            );
+        }
     }
 }

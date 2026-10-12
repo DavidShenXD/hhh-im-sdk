@@ -44,7 +44,7 @@
 | 字段 | 规则 |
 |---|---|
 | `manifestVersion` | 清单格式的版本，现在是 1 |
-| `id` | 程序编号：以小写字母开头，只含 `a-z0-9-`，长 2–32 个字符。宿主内部使用的平台编号由宿主定（一般是 `ext-<id>`），因此永远不会和内置平台（`feishu`、`slack`）或已下线的平台（`wechat`）撞名；程序不用知道这个编号（v14 起回调路径写相对路径，见 §6.1a）。同一个编号只能装一个程序。例外（v12）：带官方签名、编号是保留编号（与某个内置平台同名）的程序，平台编号就是这个编号，装上后顶替同编号的内置平台（附录 D） |
+| `id` | 程序编号：以小写字母开头，只含 `a-z0-9-`，长 2–32 个字符。宿主内部使用的平台编号由宿主定（一般是 `ext-<id>`），因此永远不会和内置平台（`feishu`、`slack`）或已下线的平台（`wechat`）撞名；程序不用知道这个编号（v14 起回调路径写相对路径，见 §6.1a）。同一个编号只能装一个程序。例外（v12，v13 改写）：编号在宿主的官方列表里的程序（保留编号）只认官方签名；其中有同编号内置平台的，平台编号就是这个编号，装上后顶替这个内置平台（附录 D），没有内置平台的平台编号照常是 `ext-<id>` |
 | `name` | 给用户看的平台名，1–20 个字符 |
 | `version` | 程序版本，semver 写法 |
 | `command` / `args` | 启动命令。`command` 按清单所在目录解析相对路径，也可以是 PATH 里能找到的程序（如 `node`、`python`）；`args` 原样传入 |
@@ -244,10 +244,15 @@
 | `confirmOnDevice` | `message` | 等待提示，例如“请在手机上确认” |
 | `input` | `fields: [{id, label, secret, placeholder, pattern}]` | 一个表单。用户提交后，宿主调用 `login/submit {flowId, values}` |
 | `message` | `text`、`tone`（`info` / `warn`） | 一段说明文字 |
+| `showText`（v13） | `caption`、`text`（至多 4096 字）、`layout`（`words` 编号的词 / `code` 一行大字 / `line` 一行等宽）、`copy`、`ack`（勾上才能点确认）、`confirmLabel`（不给就没有确认）、`waiting`（文字下面转圈写这句话） | 出示要保存或要对照的文字：恢复密钥、新电脑上的几个词、好友链接 |
+| `list`（v13） | `caption`、`rows: [{id, title, detail, tag, icon: person/device, actions: [{id, label, danger}]}]`（至多 200 行，每行至多 4 颗按钮）、`select: {min, max, confirmLabel}`（多选）、`empty`（没有行时写什么） | 一列东西：每行可带按钮，或多选后确认 |
+| `confirm`（v13） | `caption`、`person: {name, detail}`、`sections: [{title, text}]`、`text`、`confirmLabel`、`danger`（确认按钮用危险色） | 确认或说明：核对是谁、不可撤销的确认、几段说明 |
+
+v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成按钮下方居中的文字按钮，至多 8 个）；`input`、`showText`、`list`、`confirm` 还可以带 `cancelLabel`（左边按钮的文字）、`cancelChoice`（左边按钮代表一个选择，如批准框的“拒绝”，不等于关掉）、`noCancel`（没有左边的按钮：这一步不能跳过，点遮罩、按 Esc 都不关）；`input` 另可带 `caption`（字段上面的一句说明）与 `submitLabel`（提交按钮的文字）。用户在一步里做了选择——点了 `links`、行尾的按钮、多选或确认一步的确认、`showText` 的确认、`cancelChoice`——宿主发 `step/choose {flowId, choice, row?, selected?}`（宿主→程序通知，同 `login/submit`、`login/cancel`；登录与 §6.7 的操作共用）：`choice` 是 `confirm`、`links` 或行尾按钮的 `id`、或 `cancelChoice`；`row` 是哪一行的按钮，`selected` 是多选确认时选中的行。程序之后照常推下一步或结束。每段文字（说明、标题、细节、按钮文字、小标题与说明）至多 200 字，超出 §14 上限、编号空着或重复的一步宿主不显示，按这次流程失败处理。
 
 除 `message` 外，每种步骤都可以带可选的 `note: { "text", "tone" }`（`tone` 是 `info` / `warn`，与 `message` 同色调）：程序想在这一步提醒用户什么（例如“扫码后在手机上勾选同步最近的消息”），就在这一步带上，宿主把它画在这一步内容下面、按钮上面；不带就没有。宿主不解析提示的含义，文字原样显示、不支持格式；空文字或超过 §14 上限的提示不显示（这一步照常），不认识的色调按 `info`。旧宿主忽略这个字段。
 
-登录流程以程序发出的两个通知之一结束：`login/finished {flowId, account}` 或 `login/failed {flowId, message, retryable}`。用户中途取消时，宿主发 `login/cancel {flowId}`。
+登录流程以程序发出的两个通知之一结束：`login/finished {flowId, account}` 或 `login/failed {flowId, message, retryable}`。用户中途取消时，宿主发 `login/cancel {flowId}`。v13 起两者都可以带给人看的文字（登录框开着时才用得上）：`login/finished` 的 `title`、`message`（成功页的标题与一段话，不给写“<名字>已登录”“开始同步会话。”），`login/failed` 的 `title`、`retryLabel`（失败页的标题与重试按钮的文字）。
 
 - 同一时间只有一个登录流程。新的 `login/start` 会取消还没结束的旧流程。
 - 需要浏览器授权回调（OAuth）的，有两种做法：程序自己在本机回环地址上监听，并把这个地址写进 `openUrl` 步骤里；或者（v12）在登录方式里声明 `callbackPath`，由宿主在本机地址上收（§6.1a）。
@@ -273,11 +278,13 @@
 | `relay` | 中继地址（`values.relayUrl`） | 必填；https 网址，或本机回环的 http；只填网址本身 |
 | `ownApp` | App ID、App Secret（`values.appId`、`values.appSecret`） | App ID 必填；第一次用或换了 App ID 要填 Secret，不填沿用已保存的 |
 | `direct` | 不用填 | 点“登录”后照程序推来的步骤走 |
+| `host`（v13） | 不用填 | 只给宿主允许的程序（Friend：带官方签名的）；宿主在 `values.hostToken` 给当前宿主账号的访问令牌、在 `hostAccount: {name, detail, avatarUrl?}` 给这个账号（名字、个人或组织的一行说明、头像地址），没有宿主账号（游客）时这一类不能点 |
 
 - 叫法、说明、灰字、链接文字由程序写，每段至多 200 字；链接只收 https。至多 8 种，`id` 不重复；宿主不认识的 `kind` 不登记那一种。
 - **登录成功才保存**：`login/finished` 且凭据已存好之后，宿主保存这次的方式与填的内容（Secret 进系统凭据库），换了方式就删掉另一种的；失败、取消什么都不动。
 - **预填中继**（v14）：`relay` 可以写 `defaultValue`（https 网址）：没保存过中继地址时框里预填它；不写就空着让用户填。
 - **App Secret 的说明**（v14）：`ownApp` 可以写 `secretHelp`：去哪找、存在哪，画在 Secret 框旁的 ⓘ 里。
+- **用宿主账号登录**（v13）：令牌只在这次 `login/start` 里给一次，宿主当场取（快到期先刷新）、不存、不进日志与 wire 记录；程序要再用就自己放进凭据。宿主不允许的程序声明了这一类，宿主不登记它。声明了 `host`、这个宿主账号下还没登录、也没被用户在宿主里手动退出过的程序，宿主在三个时候自动开始这种登录，不用用户点：刚装好、宿主启动、切到这个宿主账号；自动开始的登录不弹登录框，程序推来 `message` 以外的步骤才弹出来，只推 `message` 就以 `login/finished` 结束时卡片直接变成已连接，失败时不弹窗、卡片写程序给的原因。用户手动退出后不再自动开始，点“登录”时登录框写着当前宿主账号，点了才开始。
 - **本机回调**：`ownApp` 声明了 `callbackPath` 时，写相对路径（v14，如 `callback`）宿主就拼在这个 IM 自己的 `/hhh-friend-im/<平台编号>/` 下面，程序不必知道宿主怎么给它编号；照 v12 写以 `/` 开头的完整路径时，必须已经在这个目录下面（不合要求时宿主不登记这种方式）。宿主在 `http://localhost:<Friend 端口><callbackPath>` 收：只在这个程序正在登录、路径对、`state` 对得上时，用 `login/callback {flowId, url}`（宿主→程序请求，`url` 是带查询串的完整地址）交给程序，页面写“<名字>授权已完成，可以关掉这个页面。登录结果在 Friend 里显示。”；其余一律拒绝。程序核对后照常以 `login/finished` 或 `login/failed` 结束。
 
 ### 6.2 凭据由宿主保存
@@ -325,6 +332,7 @@
 
 - 程序发现授权失效时，发通知 `session/expired {reason, message}`，`reason` 是 `expired`、`revoked`、`credentialInvalid` 之一。在重新登录之前，程序对之后的请求一律回授权失效错误（§12）。宿主据此停止读取，并提示用户重新登录，走 hhh-im 现有的 `AuthExpired` 流程。宿主保留登录记录与账号名，卡片写“账号 · 登录已失效”，下面一行是 `message`，右边“重新登录”；会话页、添加关注页在“登录已失效”下面也写它（v12）。
 - `session/notice {notices: [{id, text, relogin}]}`（程序→宿主通知，v12）：这个连接现在有的问题（如缺某个权限），**每次给全**，空数组就是都好了。宿主把它们画在卡片下面，每条一行；`relogin` 为真的要重新登录才能好，卡片右边多一颗“重新登录”。至多 20 条，每条至多 200 字。
+- **请用户处理的事**（v13）：每条还可以带 `action: {id, label}` 与 `prompt: true`。带 `action` 的画成待处理行（品牌黄，不是出错），右边一颗按钮写 `label`（至多 20 字），点了宿主叫 `actions/start {actionId: action.id}`（§6.7；这个编号不必出现在 `initialize.actions` 里）；`prompt` 为真的新提醒出现时，宿主窗口在前台、也没有别的对话框开着，就直接开始这个操作，关掉没处理完的留在卡片上。处理完、作废了，程序在下一次 `session/notice` 里去掉这一条。
 - 用户在 HHH 里断开连接时：
   1. 宿主调用 `session/logout`。程序尽量在平台上登出，然后丢掉内存里的会话。
   2. 宿主删除凭据，停止进程。
@@ -335,6 +343,20 @@
 - 凭据里的会话材料会过期、要定时换新的平台，存凭据时带 `renewAtMs`，并声明能力 `session.renew`。到时宿主叫 `session/renew {credential}`（宿主→程序请求，`credential` 是宿主存着的那份）：程序在跑就直接叫；没在跑时宿主临时起进程、`initialize` 之后不开账号直接叫，续完关掉。程序续完先 `credential/save` 存新的（带下次的 `renewAtMs`），再回空结果；续不了回错误（授权失效回 `authExpired`）。
 - 续期、登录保存与退出登录在宿主里串行：退出登录、卸载之后迟到的 `credential/save` 一律回错误。
 - `session/open.credentialReadOnly` 为真（凭据是借来的）时宿主不排续期。
+
+### 6.7 插件操作（v13，可选）
+
+`initialize` 结果里的 `actions` 声明程序自己的操作，按显示顺序：
+
+```json
+[{ "id": "devices", "label": "我的电脑", "scope": "account" },
+ { "id": "members", "label": "群成员", "scope": "conversation", "conversationKinds": ["group"] }]
+```
+
+- `scope` 是 `account`（放进连接卡的“管理”菜单，排在宿主自己的项前面）或 `conversation`（放进会话菜单；`conversationKinds` 限定 `direct`、`group`、`channel` 里哪几种会话才有，不写就是每种都有）。会话菜单是宿主的：里面有什么完全由会话所属的程序声明，一项都没有就没有菜单。宿主打开菜单时只按会话种类筛，不问程序；谁能做由程序在点开后的步骤里管。
+- 至多 16 项，`id` 照程序编号的规则、不重复，`label` 至多 20 字；不认识的 `scope` 那一项不登记。菜单项不单独上色，不可撤销的操作由程序在确认那一步用危险色。
+- 用户点了，宿主叫 `actions/start {actionId, conversationId?}`（会话级操作给平台会话编号），程序回 `{flowId, title?}`（`title` 是对话框的标题，至多 200 字，如提醒上的“查看”点开后写“批准新电脑”；不给时宿主用操作的名字，会话级的写“操作名 · 会话名”），之后发 `action/step {flowId, step}` 一步步走（步骤与登录同一套，§6.1），以 `action/finished {flowId, title?, message?}` 或 `action/failed {flowId, message, retryable, title?, retryLabel?}` 结束：`action/finished` 给了 `title` 或 `message` 时宿主换成成功页，都不给就直接关掉；能重试时重试就是再开始一次这项操作。表单一步提交是 `action/submit {flowId, values}`，用户关掉是 `action/cancel {flowId}`，选择是 `step/choose`（这三个同 `login/submit`、`login/cancel`，都是宿主→程序通知）。
+- 宿主用登录框同一个对话框，标题是操作的名字（会话级的写“操作名 · 会话名”）。同一个程序同一时间只走一个流程（登录或操作）；新的 `actions/start` 或 `login/start` 取消还没结束的旧流程。
 
 ## 7. 数据模型
 
@@ -633,6 +655,8 @@ JSON-RPC 的 `error.code` 按下表取值；`error.data` 里写明错误分类�
 | `retranslateRules`（v12） | 至多 32 条（重复的名字不用） |
 | 平台说明里的正则（`textPattern` 等，v12） | 1 KiB |
 | `editDraft`（v12） | 块数同发送 |
+| 操作（v13） | 至多 16 项；`label` 与提醒按钮的文字至多 20 字（多出的项、太长的不登记） |
+| 步骤（v13） | `showText.text` 至多 4096 字；列表至多 200 行、每行至多 4 颗按钮；`links` 至多 8 个；`sections` 至多 16 段；其余每段文字至多 200 字（超出的一步不显示、这次流程失败） |
 
 宿主还会核对这几件事：
 - 结果里的会话编号和请求的一致。
@@ -685,6 +709,7 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 8. 发送：只读程序会拒绝发送；拿不准的发送回 `unknown`，并且不重发。这一项需要 `--allow-send`。
 9. 凭据：程序先存后用；宿主拒绝保存时，程序保留旧凭据。
 10. v12 的新声明（没声明的跳过）：`userAdjustable`、`editsByContent` 的取值宿主认得出；`retranslateRules` 名字不重复；`emoji.textPattern` 能编译、有一个括号；`logoInk` 是合法的外框；`loginMethods` 的类型认得出、编号不重复、不超过 8 种，`callbackPath` 在这个 IM 自己的 `/hhh-friend-im/<平台编号>/` 下面；声明了 `conversations.recentActivity` 就要能回合法结果，声明了 `session.renew` 就要能答。
+11. v13 的新声明（没声明的跳过）：`actions` 的位置认得出、编号合规不重复、文字不超长、不超过 16 项；声明了账号级操作、登录着时 `actions/start` 要回流程编号；声明了 `host` 登录方式时提示只有宿主允许的（带官方签名的）程序能用。
 
 `--mock` 要求程序支持不联网的模拟模式（见实现范式 §9）；`--live --read-only` 用真实账号，只做读取。
 
@@ -761,3 +786,4 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 - 2026-10-04：v1 草案。补入 `log/write`（结构化日志）、消息 `raw` 原始数据与 `messages/retranslate`（可重新翻译）、`history=none` 平台存全部会话并走发现路径、上传即发送的平台说明、信任边界措辞纠正。
 - 2026-10-10（契约 v12，全部为可选的加法，主版本仍是 1）：会话发现（`discovery`、`conversations/recentActivity`、能力 `conversations.recentActivity`、`readDefaults.discover`）；读取与下载的数放开数值范围、`reads` 不再必填、`userAdjustable`；`editsByContent`；`retranslateRules`；`session/notice` 与 `Account.tenant` 的显示、`reactions/list` 缺权限时的 `userMessage`；登录方式 `loginMethods`、`login/start` 的 `{method, values, callbackUrl, state}`、`login/callback`；续期 `credential/save.renewAtMs`、`session/renew`、能力 `session.renew`、`session/open.credentialReadOnly`；`emoji.unlisted.guess`、`emoji.textPattern`、`emoji.whiteBackground`；清单 `logoStyle`、`logoInk`；`actions.edit.perMessage` 与消息 `editDraft`；`thread.copy`；保留编号与交接（`session/open.legacy`、`adoptedSettings`、附录 D）；§5.1“刻意不设”删去“不猜表情图”“不比内容认编辑”两项；§14 新预算；§17 新检查。
 - 2026-10-11（契约 v14，全部为可选的加法，主版本仍是 1）：编号种类 `idType`（账号、发送者、人员、提及与格式正文、卡片里的人）；格式正文与卡片里的人与资源宿主照 §7.6、附录 B 的写法收；读取结果可带 `platformRequests`；`loginMethods` 的 `callbackPath` 可写相对路径、`relay` 可写 `defaultValue`、`ownApp` 可写 `secretHelp`；`mention` 块可带 `kind`；`avatarIdentity`；表情的肤色版本（`tone`、`toneOf`）与目录的 `tones`，以及目录的 `categories`，宿主照收（以前丢掉）；`emoji.unlisted.guessPattern`；宿主照声明处理 `conversationNouns`、`emoji.namePattern`、`unlisted` 的占位；平台编号只由宿主定（协议包不再推）。
+- 2026-10-12（契约 v13，全部为可选的加法，主版本仍是 1）：登录方式 `host` 与 `login/start` 的 `values.hostToken`、`hostAccount`（宿主账号登录、自动开始）；`initialize.actions` 与 `actions/start`（结果可带 `title`）、`action/step`、`action/submit`、`action/cancel`、`action/finished`、`action/failed`（插件操作，§6.7）；步骤 `showText`、`list`、`confirm`，每一步的 `links`，`input` 的 `caption`、`submitLabel`，`cancelLabel`、`cancelChoice`、`noCancel`，以及 `step/choose`；`login/finished` 的 `title`、`message` 与 `login/failed` 的 `title`、`retryLabel`；`session/notice` 每条的 `action`、`prompt`；“保留编号”改为宿主官方列表里的编号，只有同编号的内置平台存在时平台编号才是编号本身、才顶替；§14 新预算；§17 新检查。

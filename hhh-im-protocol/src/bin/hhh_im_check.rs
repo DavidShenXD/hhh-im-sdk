@@ -290,6 +290,7 @@ async fn run(args: Args) -> i32 {
         );
     }
     check_v12_declarations(&mut report, &manifest, &platform, &init);
+    check_v13_declarations(&mut report, &init);
 
     // 4. session/open。
     let open = call_t(
@@ -333,6 +334,7 @@ async fn run(args: Args) -> i32 {
     // 给推送一点时间到达。
     tokio::time::sleep(Duration::from_millis(300)).await;
     check_v12_calls(&conn, &mut report, &caps, online).await;
+    check_v13_calls(&conn, &mut report, &init, online).await;
 
     // 5–7. 推送数据的检查（push-only 平台）。
     if platform.history == HistoryMode::None && online {
@@ -544,6 +546,92 @@ fn check_login_methods(report: &mut Report, manifest: &Manifest, init: &Value) {
                 manifest.id
             ),
         );
+    }
+}
+
+/// 契约 provider-protocol v13 的新声明：操作写对；声明了用宿主账号登录时提示只有官方插件能用。没声明的跳过。
+fn check_v13_declarations(report: &mut Report, init: &Value) {
+    use hhh_im_protocol::budget::ACTIONS_MAX;
+    use hhh_im_protocol::method::{ActionDecl, LoginKind, LoginMethod, action_problem};
+    match init.get("actions").filter(|v| !v.is_null()) {
+        None => report.skip("操作声明写法对", "没声明 actions"),
+        Some(declared) => match serde_json::from_value::<Vec<ActionDecl>>(declared.clone()) {
+            Err(e) => report.fail("操作声明写法对", format!("actions 格式不对：{e}")),
+            Ok(actions) if actions.len() > ACTIONS_MAX => report.fail(
+                "操作声明写法对",
+                format!(
+                    "至多 {ACTIONS_MAX} 项，声明了 {} 项（多出的不会出现在菜单里）",
+                    actions.len()
+                ),
+            ),
+            Ok(actions) => {
+                let mut ids = std::collections::BTreeSet::new();
+                match actions.iter().find_map(|a| {
+                    action_problem(a)
+                        .map(|why| format!("“{}”：{why}", a.id))
+                        .or_else(|| {
+                            (!ids.insert(a.id.as_str())).then(|| format!("编号“{}”重复了", a.id))
+                        })
+                }) {
+                    None => report.pass("操作声明写法对"),
+                    Some(why) => report.fail("操作声明写法对", why),
+                }
+            }
+        },
+    }
+    let host = init
+        .get("loginMethods")
+        .and_then(|v| serde_json::from_value::<Vec<LoginMethod>>(v.clone()).ok())
+        .is_some_and(|methods| methods.iter().any(|m| m.kind == LoginKind::Host));
+    if host {
+        report.skip(
+            "用宿主账号登录",
+            "声明了 host：只有带官方签名的插件能用，自定义插件宿主不登记这一类（登录框里没有它）",
+        );
+    } else {
+        report.skip("用宿主账号登录", "没声明 host 登录方式");
+    }
+}
+
+/// 契约 provider-protocol v13 的新方法：声明了操作就要能开始（`actions/start` 回流程编号），试完立刻取消。只有会话级
+/// 操作时要一个会话才能试，跳过。
+async fn check_v13_calls(conn: &Arc<Connection>, report: &mut Report, init: &Value, online: bool) {
+    use hhh_im_protocol::method::{ActionDecl, ActionScope, ActionsStartResult};
+    let actions: Vec<ActionDecl> = init
+        .get("actions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let Some(action) = actions.iter().find(|a| a.scope == ActionScope::Account) else {
+        if actions.is_empty() {
+            report.skip("操作能开始", "没声明 actions");
+        } else {
+            report.skip("操作能开始", "只有会话级操作，要一个会话才能试");
+        }
+        return;
+    };
+    if !online {
+        report.skip("操作能开始", "没登录，试不了");
+        return;
+    }
+    match call_t(
+        conn,
+        "actions/start",
+        json!({ "actionId": action.id }),
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(v) => match serde_json::from_value::<ActionsStartResult>(v) {
+            Ok(r) if !r.flow_id.is_empty() => {
+                let _ = conn
+                    .notify("action/cancel", json!({ "flowId": r.flow_id }))
+                    .await;
+                report.pass("操作能开始");
+            }
+            Ok(_) => report.fail("操作能开始", format!("“{}”回的流程编号是空的", action.id)),
+            Err(e) => report.fail("操作能开始", format!("“{}”的结果格式不对：{e}", action.id)),
+        },
+        Err(e) => report.fail("操作能开始", format!("“{}”：{e}", action.id)),
     }
 }
 
@@ -905,6 +993,50 @@ mod v12_tests {
             rows(&report)
         );
         assert!(pattern_problem("(", "表情名").is_some(), "编不过");
+    }
+
+    // 契约 provider-protocol v13：操作声明没声明跳过、写对通过、写错失败；声明了 host 登录时给出“只有官方插件能用”的提示。
+    #[test]
+    fn v13_declarations_pass_fail_and_skip() {
+        let mut report = Report::new();
+        check_v13_declarations(&mut report, &json!({}));
+        assert_eq!(status_of(&report, "操作声明写法对"), "skip");
+        assert_eq!(status_of(&report, "用宿主账号登录"), "skip");
+
+        let mut report = Report::new();
+        check_v13_declarations(
+            &mut report,
+            &json!({
+                "actions": [
+                    { "id": "devices", "label": "我的电脑", "scope": "account" },
+                    { "id": "members", "label": "群成员", "scope": "conversation", "conversationKinds": ["group"] }
+                ],
+                "loginMethods": [{ "id": "cindy", "kind": "host", "label": "用 Cindy 账号登录" }]
+            }),
+        );
+        assert_eq!(status_of(&report, "操作声明写法对"), "pass");
+        let hint = report
+            .rows
+            .iter()
+            .find(|(n, _, _)| n == "用宿主账号登录")
+            .unwrap();
+        assert!(hint.2.contains("官方"), "{}", hint.2);
+
+        for bad in [
+            json!([{ "id": "a1", "label": "甲", "scope": "account" }, { "id": "a1", "label": "乙", "scope": "account" }]),
+            json!([{ "id": "Bad Id", "label": "甲", "scope": "account" }]),
+            json!([{ "id": "a1", "label": "这是一个超过二十个字的菜单项文字一二三四五六", "scope": "account" }]),
+            json!([{ "id": "a1", "label": "甲", "scope": "toolbar" }]),
+            json!(
+                (0..17)
+                    .map(|i| json!({ "id": format!("a{i}"), "label": "项", "scope": "account" }))
+                    .collect::<Vec<_>>()
+            ),
+        ] {
+            let mut report = Report::new();
+            check_v13_declarations(&mut report, &json!({ "actions": bad }));
+            assert_eq!(status_of(&report, "操作声明写法对"), "fail", "{bad}");
+        }
     }
 }
 
