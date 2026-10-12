@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod content;
 pub mod method;
 pub mod platform;
 pub mod release;
@@ -27,6 +28,9 @@ pub mod transport;
 
 #[cfg(feature = "package")]
 pub mod package;
+
+#[cfg(feature = "runtime")]
+pub mod runtime;
 
 pub use method::Method;
 pub use platform::{Capabilities, Manifest, PlatformDesc, SettingDecl};
@@ -105,4 +109,8 @@ pub mod budget {
     pub const ROW_ACTIONS_MAX: usize = 4;
     /// 确认一步最多几段带小标题的说明。
     pub const STEP_SECTIONS_MAX: usize = 16;
+    /// 一次 `people/get` 问几个（`ids` 与 `bots` 合计）：程序没声明 `people.batchMax` 时（v15）。
+    pub const PEOPLE_GET_DEFAULT: usize = 100;
+    /// `people.batchMax` 的上限（v15）。
+    pub const PEOPLE_GET_MAX: usize = 2000;
 }

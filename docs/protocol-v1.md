@@ -223,6 +223,7 @@
 ```
 
 - v12：`conversations.recentActivity` 为真时程序能回答 `conversations/recentActivity`（会话发现，§8）；`session.renew` 为真时程序能用存着的凭据续期（`session/renew`，§6.6）。
+- v15：`people.bots` 为真时程序能按编号读机器人与应用（`people/get` 的 `bots`），要先声明 `people.get`；不写时宿主把机器人一律记成“没有”、不为它们问程序。`people.batchMax`（1–2000）是一次 `people/get` 最多问几个，平台一次读一大批更省时写（如读一遍整份成员名单就认出一大批人）；不写是 100。
 
 - `retranslate` 为真时，程序随消息附带去凭据化的原始数据（§7.4 的 `raw`），宿主存一张原始数据表；程序翻译规则升级后，宿主调 `messages/retranslate`（§10.1）让它把本地旧消息重新翻译一遍。为假时不附带原始数据、也不会被调用重译。
 
@@ -413,7 +414,7 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 | `type` | 字段 | 说明 |
 |---|---|---|
 | `text` | `text` | 纯文字，原样给出，不含任何标记 |
-| `mention` | `userId`?、`idType`?、`kind`?、`name`?、`everyone` | 经平台结构确认的提及。提及所有人时 `everyone` 为真；`kind`（v14）是 `user` 或 `bot`，不写当 `user`：宿主显示机器人时先用这里的名字，显示人时先用人名册的 |
+| `mention` | `userId`?、`idType`?、`kind`?、`name`?、`everyone` | 经平台结构确认的提及。提及所有人时 `everyone` 为真；`kind`（v14）是 `user` 或 `bot`，不写当 `user`：宿主显示机器人时先用这里的名字，显示人时先用人名册的。提及所有人可带平台对“所有人”的叫法（v15）：`name` 写叫法（如 Slack 的 `here`、`channel`、`everyone`，意思各不相同），宿主照写“@叫法”，`userId`、`idType` 可选、照样记下；不带叫法写“@所有人” |
 | `resource` | `resource: Resource`、`name`?、`width`?、`height`? | 图片、文件、表情包 |
 | `rich` | `root` | 格式正文，即 mdast 的一个子集，节点见 §7.6 |
 | `markdown` | `text` | 平台明确标为 Markdown 的原文，由宿主解析 |
@@ -456,13 +457,13 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 | `conversations/search` | `text`（1–50 个字）、`limit`（1–20）、`cursor`? | `{items, next?, notice?}` | `conversations.search` |
 | `conversations/members` | `conversationId`、`limit`、`cursor`? | `{items: Person[], next?}` | `conversations.members` |
 | `conversations/findDirect` | `userId` | `{conversationId?, notice?}`。只定位已有的私聊，不新建会话 | `conversations.findDirect` |
-| `people/get` | `ids[]`（不超过 100 个） | `{found: Person[], missing: string[]}`。平台明确说不存在的放进 `missing`；这次没读到的，两边都不放 | `people.get` |
+| `people/get` | `ids[]`、`bots[]`?（合计不超过 100 个；声明了 `people.batchMax` 时不超过它） | `{found: Person[], missing: string[]}`。平台明确说不存在的放进 `missing`；这次没读到的，两边都不放（宿主下次再读）。`bots` 是消息里认出的机器人与应用的编号，只在声明 `people.bots` 时给，读到的种类写 `bot`（v15） | `people.get` |
 | `people/search` | 同会话搜索 | `{items: Person[], next?, notice?}` | `people.search` |
 | `messages/list` | `conversationId`、`threadId`?、`afterMs`?、`beforeMs`?、`newestFirst`、`limit`、`cursor`? | `{items: Message[], next?}`，每页里按从旧到新排 | `messages.list` |
 | `messages/get` | `conversationId`、`messageId` | `Message` | `messages.get` |
 | `reactions/list` | `conversationId`、`messageId`、`limit`（不超过 50）、`cursor`? | `{items: Reaction[], next?}` | `reactions.list` |
 | `emoji/catalog` | 无 | `{emojis: Emoji[], categories?, tones?, updatedAtMs}` | `reactions.catalog` |
-| `conversations/recentActivity` | `sinceMs`、`pagesMax` | `{items: [{conversationId, kind, firstMs, latestMs, peerId?}], complete}`：这段时间里有人（不算机器人、应用、经接口发的）发过消息的会话，每个会话一项，按最新一条从新到旧；只用来认会话，不交出消息内容；`peerId` 是私聊的对方；翻满 `pagesMax` 页还没到起点时 `complete` 为假。一次至多 1000 项（v12） | `conversations.recentActivity` |
+| `conversations/recentActivity` | `sinceMs`、`pagesMax` | `{items: [{conversationId, kind, firstMs, latestMs, peerId?, conversation?}], complete}`：这段时间里有人（不算机器人、应用、经接口发的）发过消息的会话，每个会话一项，按最新一条从新到旧；只用来认会话，不交出消息内容；`peerId` 是私聊的对方；`conversation`（v15，可选）是群与频道的资料（§7.2 的 Conversation），程序手边正好有时给，宿主就不再为它读一次 `conversations/get`，私聊不给；翻满 `pagesMax` 页还没到起点时 `complete` 为假。一次至多 1000 项（v12） | `conversations.recentActivity` |
 
 - `messages/list` 的翻页规则同 hhh-im 的 `MessageQuery`：`newestFirst` 为真时，从最新往更早翻。
 - **这次向平台发了几个请求**（v14，可选）：上表每个方法的结果对象都可以多带 `"platformRequests": <正整数>`。宿主每调一次先记一次平台读取，多出的照样记进这个平台的读取额度（一次调用至多按 64 个记），之后的读取据此等；不写就是 1。
@@ -710,6 +711,7 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 9. 凭据：程序先存后用；宿主拒绝保存时，程序保留旧凭据。
 10. v12 的新声明（没声明的跳过）：`userAdjustable`、`editsByContent` 的取值宿主认得出；`retranslateRules` 名字不重复；`emoji.textPattern` 能编译、有一个括号；`logoInk` 是合法的外框；`loginMethods` 的类型认得出、编号不重复、不超过 8 种，`callbackPath` 在这个 IM 自己的 `/hhh-friend-im/<平台编号>/` 下面；声明了 `conversations.recentActivity` 就要能回合法结果，声明了 `session.renew` 就要能答。
 11. v13 的新声明（没声明的跳过）：`actions` 的位置认得出、编号合规不重复、文字不超长、不超过 16 项；声明了账号级操作、登录着时 `actions/start` 要回流程编号；声明了 `host` 登录方式时提示只有宿主允许的（带官方签名的）程序能用。
+12. v15：声明了 `people.get` 时，问一个不存在的编号（声明了 `people.bots` 时人与机器人各一个），结果读得懂、同一个编号不会既在 `found` 又在 `missing`；`people.bots` 要先声明 `people.get`、`people.batchMax` 在 1–2000 之间（随能力组合一起查）。
 
 `--mock` 要求程序支持不联网的模拟模式（见实现范式 §9）；`--live --read-only` 用真实账号，只做读取。
 
@@ -787,3 +789,4 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 - 2026-10-10（契约 v12，全部为可选的加法，主版本仍是 1）：会话发现（`discovery`、`conversations/recentActivity`、能力 `conversations.recentActivity`、`readDefaults.discover`）；读取与下载的数放开数值范围、`reads` 不再必填、`userAdjustable`；`editsByContent`；`retranslateRules`；`session/notice` 与 `Account.tenant` 的显示、`reactions/list` 缺权限时的 `userMessage`；登录方式 `loginMethods`、`login/start` 的 `{method, values, callbackUrl, state}`、`login/callback`；续期 `credential/save.renewAtMs`、`session/renew`、能力 `session.renew`、`session/open.credentialReadOnly`；`emoji.unlisted.guess`、`emoji.textPattern`、`emoji.whiteBackground`；清单 `logoStyle`、`logoInk`；`actions.edit.perMessage` 与消息 `editDraft`；`thread.copy`；保留编号与交接（`session/open.legacy`、`adoptedSettings`、附录 D）；§5.1“刻意不设”删去“不猜表情图”“不比内容认编辑”两项；§14 新预算；§17 新检查。
 - 2026-10-11（契约 v14，全部为可选的加法，主版本仍是 1）：编号种类 `idType`（账号、发送者、人员、提及与格式正文、卡片里的人）；格式正文与卡片里的人与资源宿主照 §7.6、附录 B 的写法收；读取结果可带 `platformRequests`；`loginMethods` 的 `callbackPath` 可写相对路径、`relay` 可写 `defaultValue`、`ownApp` 可写 `secretHelp`；`mention` 块可带 `kind`；`avatarIdentity`；表情的肤色版本（`tone`、`toneOf`）与目录的 `tones`，以及目录的 `categories`，宿主照收（以前丢掉）；`emoji.unlisted.guessPattern`；宿主照声明处理 `conversationNouns`、`emoji.namePattern`、`unlisted` 的占位；平台编号只由宿主定（协议包不再推）。
 - 2026-10-12（契约 v13，全部为可选的加法，主版本仍是 1）：登录方式 `host` 与 `login/start` 的 `values.hostToken`、`hostAccount`（宿主账号登录、自动开始）；`initialize.actions` 与 `actions/start`（结果可带 `title`）、`action/step`、`action/submit`、`action/cancel`、`action/finished`、`action/failed`（插件操作，§6.7）；步骤 `showText`、`list`、`confirm`，每一步的 `links`，`input` 的 `caption`、`submitLabel`，`cancelLabel`、`cancelChoice`、`noCancel`，以及 `step/choose`；`login/finished` 的 `title`、`message` 与 `login/failed` 的 `title`、`retryLabel`；`session/notice` 每条的 `action`、`prompt`；“保留编号”改为宿主官方列表里的编号，只有同编号的内置平台存在时平台编号才是编号本身、才顶替；§14 新预算；§17 新检查。
+- 2026-10-12（契约 v15，可选的加法，主版本仍是 1）：能力 `people.bots` 与 `people/get` 的 `bots`（按编号读机器人与应用）、`people.batchMax`（一次读人的上限）；宿主照 `people/get` 的结果办——只把 `missing` 记成“没有”，两边都没有的下次再读（以前没返回的一律记“没有”）；提及所有人可带平台的叫法（`mention` 的 `name`，内容块与格式正文里都是）；会话发现的一项可带群与频道的资料（`conversation`）；协议包的插件运行时（`runtime` 部件）与格式正文、卡片的类型（`content` 模块）。

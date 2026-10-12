@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::platform::{Capabilities, PlatformDesc, SettingDecl};
 use crate::rpc::ReauthReason;
 use crate::types::{
-    Account, ConversationKind, Emoji, EmojiCategory, EmojiTone, Event, Message, Outgoing, Person,
-    Raw, ResourceKind, SendOutcome, SendTarget,
+    Account, Conversation, ConversationKind, Emoji, EmojiCategory, EmojiTone, Event, Message,
+    Outgoing, Person, Raw, ResourceKind, SendOutcome, SendTarget,
 };
 
 /// 协议里的方法名。字符串形式见 [`Method::as_str`]。
@@ -1542,8 +1542,11 @@ pub struct FindDirectResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeopleGetParams {
-    /// 用户编号（≤100 个）。
+    /// 用户编号（与 `bots` 合计 ≤100 个）。
     pub ids: Vec<String>,
+    /// 机器人与应用的编号（v15，可选）：只在程序声明 `people.bots` 时给；读到的放进 `found`、种类写 `bot`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bots: Vec<String>,
 }
 
 /// `people/get` 结果。
@@ -1848,6 +1851,10 @@ pub struct ActivityItem {
     /// 私聊的对方（不是本人的发送者）；群或只有本人发过时为空。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_id: Option<String>,
+    /// 群与频道的资料（v15，可选）：程序手边正好有（如本机记着的会话列表）时给，宿主就不再为它读一次
+    /// `conversations/get`；私聊不给（名字与头像是对方本人的，宿主另读）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<Conversation>,
 }
 
 /// `messages/retranslate` 参数（protocol-v1 §10.1）。
@@ -2132,6 +2139,21 @@ mod tests {
         let warn: LoginNote =
             serde_json::from_value(json!({ "text": "注意", "tone": "warn" })).unwrap();
         assert_eq!(warn.tone, MessageTone::Warn);
+    }
+
+    // 契约 provider-protocol v15：会话发现的一项可带群与频道的资料；不带时写回不多出键。
+    #[test]
+    fn v15_activity_items_may_carry_the_conversation() {
+        use serde_json::json;
+        let with = json!({ "conversationId": "C1", "kind": "channel", "firstMs": 1, "latestMs": 2,
+            "conversation": { "id": "C1", "kind": "channel", "name": "general", "private": true } });
+        let item: ActivityItem = serde_json::from_value(with.clone()).unwrap();
+        assert_eq!(item.conversation.as_ref().map(|c| c.name.as_str()), Some("general"));
+        assert_eq!(serde_json::to_value(&item).unwrap(), with);
+        let old = json!({ "conversationId": "D1", "kind": "direct", "firstMs": 1, "latestMs": 2, "peerId": "U1" });
+        let item: ActivityItem = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(item.conversation, None);
+        assert_eq!(serde_json::to_value(&item).unwrap(), old, "旧形状写回不多出键");
     }
 
     // 契约 provider-protocol v13：新方法名原样往返。

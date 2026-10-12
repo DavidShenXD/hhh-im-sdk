@@ -15,7 +15,7 @@
 [package]
 name = "hhh-im-protocol"
 # 协议包自己定版、不跟 HHH 走：公开仓库 hhh-im-sdk 按这个版本打标签（scripts/im-sdk-export.py 读它）。
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/MagicLizi/hhh-im-sdk"
@@ -26,6 +26,9 @@ default = []
 # transport：子进程 stdio 传输（tokio）。宿主侧（hhh-im provider 适配器、自检工具）开它；
 # 只用线上类型与编解码的一方可以不开。
 transport = ["dep:tokio", "dep:regex-lite"]
+# runtime：写插件程序用的运行时（契约 provider-protocol v15 §3.4）：协议服务（并发处理、取消、向宿主发请求等回复）、
+# 日志转 log/write、资源分段读、上传攒齐与核对、平台请求计数。只给插件开，HHH 宿主不用。
+runtime = ["dep:tokio", "dep:tracing-subscriber", "dep:base64", "dep:sha2"]
 # package：安装包 .hhhim 的打包、读清单与解包（宿主安装与更新、打包工具 hhh-im-pack 用）。
 package = ["dep:zip", "dep:sha2", "dep:ed25519-dalek", "dep:getrandom"]
 
@@ -34,10 +37,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 tracing = { version = "0.1" }
 # 子进程、异步读写、计时、通道：只在 transport feature 下用。
-tokio = { version = "1", default-features = false, optional = true, features = ["rt", "process", "io-util", "time", "sync", "macros"] }
+tokio = { version = "1", default-features = false, optional = true, features = ["rt", "process", "io-util", "io-std", "time", "sync", "macros"] }
 # 自检工具核对插件声明的正文表情写法能不能编译（契约 provider-protocol v12 缺口 9），只在 transport feature 下用。
 regex-lite = { version = "0.1", optional = true }
-# 安装包：zip 读写与 sha256，只在 package feature 下用。
+# 插件运行时：tracing 日志接成 log/write（只用注册表部件）、资源与上传按 base64 传，只在 runtime feature 下用。
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"], optional = true }
+base64 = { version = "0.22", optional = true }
+# 安装包：zip 读写与 sha256（runtime 也用 sha256 核对上传），只在 package、runtime feature 下用。
 zip = { version = "8", default-features = false, features = ["deflate"], optional = true }
 sha2 = { version = "0.11", optional = true }
 # 打包工具的官方签名（keygen 与 --sign-key，契约 provider-protocol v14）：ed25519 与生成钥匙用的系统随机数，只在 package feature 下用。

@@ -10,7 +10,7 @@
 
 | 内容 | 说明 |
 |---|---|
-| `hhh-im-protocol/` | 协议的 Rust 包：线上类型、JSON-RPC 编解码、子进程 stdio 传输（feature `transport`）、安装包 `.hhhim` 的打包与解包（feature `package`） |
+| `hhh-im-protocol/` | 协议的 Rust 包：线上类型（含格式正文与卡片的 `content`）、JSON-RPC 编解码、写插件程序用的运行时（feature `runtime`）、子进程 stdio 传输（feature `transport`）、安装包 `.hhhim` 的打包与解包（feature `package`） |
 | `hhh-im-check` | 自检工具：拿你的插件把协议用例跑一遍 |
 | `hhh-im-pack` | 打包工具：把插件文件夹打成 `.hhhim`、算 sha256、写版本索引；`--publish` 发到 GitHub Release 或 GitLab |
 | `docs/protocol-v1.md` | 协议规范 |
@@ -22,13 +22,17 @@
 
 ```toml
 [dependencies]
-hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.3.0", features = ["transport"] }
+hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.4.0", features = ["runtime"] }
 ```
+
+运行时（`hhh_im_protocol::runtime`）管每个插件都要的、和平台无关的那一半：读写标准输入输出、宿主的请求各开一个任务并发处理、
+`$/cancel`、向宿主发请求并等回复（`credential/save`、`events/push`）、日志转 `log/write`、资源分段读、上传攒齐与核对、
+向平台发了几次请求。插件实现 `Plugin`（收到某个方法怎么办），交给 `serve_on` / `serve_stdio`；模板仓库就是这样写的。
 
 装两个工具：
 
 ```sh
-cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.3.0 hhh-im-protocol --features transport,package
+cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.4.0 hhh-im-protocol --features transport,package
 ```
 
 - 自检：`hhh-im-check <插件文件夹>/hhh-im-provider.json`

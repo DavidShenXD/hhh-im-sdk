@@ -609,6 +609,14 @@ pub struct PeopleCaps {
     /// 能搜索人。
     #[serde(default)]
     pub search: bool,
+    /// 能按编号读机器人与应用（v15，可选）：宿主把消息里认出的机器人编号放进 `people/get` 的 `bots` 一起读。
+    /// 不写时机器人一律算“没有”，宿主不为它们问程序。要先能 `get`。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bots: bool,
+    /// 一次 `people/get` 最多问几个（`ids` 与 `bots` 合计；v15，可选）：平台一次读一大批更省时写（如读一遍整份成员名单
+    /// 就认出一大批人），1 到 [`crate::budget::PEOPLE_GET_MAX`]；不写是 [`crate::budget::PEOPLE_GET_DEFAULT`]。要先能 `get`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_max: Option<u32>,
 }
 
 /// 发送能力。
@@ -815,6 +823,20 @@ impl Capabilities {
             }
             _ => {}
         }
+        if self.people.bots && !self.people.get {
+            return Err("声明 people.bots 时必须声明 people.get（机器人与人一起按编号读）".into());
+        }
+        if let Some(max) = self.people.batch_max {
+            if !self.people.get {
+                return Err("声明 people.batchMax 时必须声明 people.get".into());
+            }
+            if max == 0 || max as usize > crate::budget::PEOPLE_GET_MAX {
+                return Err(format!(
+                    "people.batchMax 要在 1 到 {} 之间",
+                    crate::budget::PEOPLE_GET_MAX
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -923,6 +945,48 @@ mod tests {
         assert!(push.check_consistent(HistoryMode::None).is_err());
         push.events.conversations = true;
         assert!(push.check_consistent(HistoryMode::None).is_ok());
+    }
+
+    // 契约 provider-protocol v15：读机器人是可选声明，要先能按编号读人；不写时序列化里没有这一键（旧宿主照旧）。
+    #[test]
+    fn people_bots_needs_get_and_is_omitted_when_false() {
+        let mut caps = Capabilities::default();
+        caps.messages.list = true;
+        caps.people.bots = true;
+        assert!(caps.check_consistent(HistoryMode::Server).is_err());
+        caps.people.get = true;
+        assert!(caps.check_consistent(HistoryMode::Server).is_ok());
+        let on = serde_json::to_value(caps.people).unwrap();
+        assert_eq!(on["bots"], true);
+        let off = serde_json::to_value(PeopleCaps {
+            get: true,
+            search: false,
+            bots: false,
+            batch_max: None,
+        })
+        .unwrap();
+        assert!(off.get("bots").is_none());
+        assert!(off.get("batchMax").is_none());
+        let old: PeopleCaps =
+            serde_json::from_value(serde_json::json!({ "get": true, "search": true })).unwrap();
+        assert!(!old.bots, "旧插件不写就是不读机器人");
+        assert_eq!(old.batch_max, None, "旧插件不写就是一次 100 个");
+    }
+
+    // 契约 provider-protocol v15：一次读人的上限可选，要先能按编号读人、在 1 到 2000 之间。
+    #[test]
+    fn people_batch_max_needs_get_and_stays_in_range() {
+        let mut caps = Capabilities::default();
+        caps.messages.list = true;
+        caps.people.batch_max = Some(2000);
+        assert!(caps.check_consistent(HistoryMode::Server).is_err());
+        caps.people.get = true;
+        assert!(caps.check_consistent(HistoryMode::Server).is_ok());
+        assert_eq!(serde_json::to_value(caps.people).unwrap()["batchMax"], 2000);
+        for bad in [0, 2001] {
+            caps.people.batch_max = Some(bad);
+            assert!(caps.check_consistent(HistoryMode::Server).is_err(), "{bad}");
+        }
     }
 
     #[test]

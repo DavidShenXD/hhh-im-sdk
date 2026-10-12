@@ -684,6 +684,27 @@ async fn check_v12_calls(
             Err(e) => report.fail("会话发现能调", e),
         }
     }
+    if !caps.people.get {
+        report.skip("人名册分清没有与没读到", "没声明 people.get");
+    } else if !online {
+        report.skip("人名册分清没有与没读到", "没登录，读不了");
+    } else {
+        // 问一个不存在的编号（声明了读机器人时人与机器人各一个）：结果读得懂，同一个编号不能既读到又“没有”（v15）。
+        let mut params = json!({ "ids": ["hhh-im-check-nobody"] });
+        if caps.people.bots {
+            params["bots"] = json!(["hhh-im-check-nobot"]);
+        }
+        match call_t(conn, "people/get", params, Duration::from_secs(30)).await {
+            Ok(v) => match serde_json::from_value::<hhh_im_protocol::method::PeopleGetResult>(v) {
+                Ok(r) if r.found.iter().any(|p| r.missing.contains(&p.id)) => {
+                    report.fail("人名册分清没有与没读到", "有编号既在 found 又在 missing 里");
+                }
+                Ok(_) => report.pass("人名册分清没有与没读到"),
+                Err(e) => report.fail("人名册分清没有与没读到", format!("结果格式不对：{e}")),
+            },
+            Err(e) => report.fail("人名册分清没有与没读到", e),
+        }
+    }
     if caps.session.renew {
         // 拿一份假凭据叫它续期：回成功或回错误都算能答，超时不算。
         match tokio::time::timeout(
