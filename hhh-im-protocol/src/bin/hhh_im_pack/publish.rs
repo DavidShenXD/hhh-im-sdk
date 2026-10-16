@@ -208,6 +208,18 @@ impl Publish {
         }
     }
 
+    /// 交给 curl 的请求头：调用方另给 `Accept` 时用它的，不再带默认那条。两条 `Accept` 一起发，GitHub 按第一条
+    /// 回附件的 JSON 说明而不是文件本身——读仓库里已有的版本索引就会读成说明（第二台电脑补传别的目标时合不上）。
+    fn headers_for(&self, extra_headers: &[&str]) -> String {
+        let accept = |line: &str| line.to_ascii_lowercase().starts_with("accept:");
+        let own_accept = extra_headers.iter().any(|header| accept(header));
+        self.headers()
+            .lines()
+            .filter(|line| !(own_accept && accept(line)))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
     fn curl(
         &self,
         method: &str,
@@ -217,7 +229,7 @@ impl Publish {
     ) -> Result<Reply, String> {
         run_curl(
             &curl_args(method, url, &body, extra_headers),
-            &self.headers(),
+            &self.headers_for(extra_headers),
         )
     }
 
@@ -705,6 +717,59 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(page.ends_with("/-/releases/v0.4.0"));
+    }
+
+    // 第二台电脑补传别的目标：读回 GitHub 上同一版本已有的索引文件本身。附件地址只带一条
+    // `Accept: application/octet-stream`；GitHub 遇到 `application/vnd.github+json` 在前时回的是附件的 JSON 说明。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_target_reads_back_the_index_file_not_its_description() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let index = r#"{"indexVersion":1,"id":"demo-im","version":"0.4.0","packages":[{"target":"macos-arm64","file":"demo-im-0.4.0-macos-arm64.hhhim","size":7,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#;
+        Mock::given(method("GET"))
+            .and(path("/repos/someone/hhh-demo/releases/tags/v0.4.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"id":7,"assets":[{{"id":9,"name":"hhhim-release.json","url":"{}/repos/someone/hhh-demo/releases/assets/9"}}]}}"#,
+                server.uri()
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/someone/hhh-demo/releases/assets/9"))
+            .and(header("accept", "application/vnd.github+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"id":9,"name":"hhhim-release.json","content_type":"application/json","size":208}"#,
+            ))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/someone/hhh-demo/releases/assets/9"))
+            .and(header("accept", "application/octet-stream"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/storage/index", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/storage/index"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(index))
+            .mount(&server)
+            .await;
+        let publish = publisher(
+            Source::Github {
+                repo: "someone/hhh-demo".into(),
+            },
+            &server.uri(),
+        );
+        let read = tokio::task::spawn_blocking(move || publish.remote_index("demo-im"))
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("读回已有的索引");
+        assert_eq!(read.packages[0].file, "demo-im-0.4.0-macos-arm64.hhhim");
     }
 
     // 仓库里最新的正式版本：GitLab 的“最新”302 到具体版本，照带令牌跟过去。

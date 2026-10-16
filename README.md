@@ -22,7 +22,7 @@
 
 ```toml
 [dependencies]
-hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.6.0", features = ["runtime"] }
+hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.6.1", features = ["runtime"] }
 ```
 
 运行时（`hhh_im_protocol::runtime`）管每个插件都要的、和平台无关的那一半：读写标准输入输出、宿主的请求各开一个任务并发处理、
@@ -33,7 +33,7 @@ hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.6
 装两个工具：
 
 ```sh
-cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.6.0 hhh-im-protocol --features transport,package
+cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.6.1 hhh-im-protocol --features transport,package
 ```
 
 - 自检：`hhh-im-check <插件文件夹>/hhh-im-provider.json`
