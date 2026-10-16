@@ -117,6 +117,8 @@ pub enum Method {
     MessagesEdit,
     /// 重新翻译。
     MessagesRetranslate,
+    /// 维护已存的统一消息，不联网。
+    MessagesMaintain,
     /// 点表情。
     ReactionsAdd,
     /// 取消表情。
@@ -184,6 +186,7 @@ impl Method {
             Method::MessagesRecall => "messages/recall",
             Method::MessagesEdit => "messages/edit",
             Method::MessagesRetranslate => "messages/retranslate",
+            Method::MessagesMaintain => "messages/maintain",
             Method::ReactionsAdd => "reactions/add",
             Method::ReactionsRemove => "reactions/remove",
             Method::EventsPush => "events/push",
@@ -253,6 +256,7 @@ impl Method {
             Method::MessagesRecall,
             Method::MessagesEdit,
             Method::MessagesRetranslate,
+            Method::MessagesMaintain,
             Method::ReactionsAdd,
             Method::ReactionsRemove,
             Method::EventsPush,
@@ -420,7 +424,8 @@ pub struct LegacyHandover {
 /// 内置飞书、Slack 交接用的格式名（规范附录 D）。
 pub const LEGACY_FORMAT_BUILTIN_V1: &str = "hhh-builtin-v1";
 
-/// 插件接过交接后，请宿主写进它自己设置里的东西（`session/open` 在线结果的 `adoptedSettings`）。
+/// 插件请宿主写进自身设置的交接结果（`session/open` 在线结果的 `adoptedSettings`）。
+/// 普通打开也可从当前有效凭据返回同一结果，帮助宿主补完被中断的交接；借用凭据时不返回。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdoptedSettings {
@@ -455,7 +460,7 @@ pub enum SessionOpenResult {
     Online {
         /// 已核验账号。
         account: Account,
-        /// 接过交接时请宿主写进插件设置的东西（契约 provider-protocol v12 缺口 14）；没有为空。
+        /// 交接或恢复未完成交接时，请宿主保存的插件设置；没有为空。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         adopted_settings: Option<AdoptedSettings>,
     },
@@ -1887,6 +1892,65 @@ pub struct RetranslateResult {
     pub messages: Vec<Message>,
 }
 
+/// 已存消息维护的工作种类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MaintenanceMode {
+    /// 纯本地修正正文与编辑标记。
+    Repair,
+    /// 纯本地判断哪些消息需要宿主稍后重新读取。
+    Reread,
+}
+
+/// `messages/maintain` 参数；一次只执行一个声明过的规则。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceParams {
+    /// 工作种类。
+    pub mode: MaintenanceMode,
+    /// 规则名；沿用已发布名字以保留完成记录。
+    pub rule: String,
+    /// 当前统一消息，不需要 raw；条数与字节数都受预算约束。
+    pub messages: Vec<Message>,
+}
+
+/// 同一账号内的一条消息。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceRef {
+    /// 会话编号。
+    pub conversation_id: String,
+    /// 消息编号。
+    pub id: String,
+}
+
+/// 本地修正只改变正文及翻译状态；其余身份、话题、资源来源与原始数据由宿主保留。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceUpdate {
+    /// 消息位置。
+    #[serde(flatten)]
+    pub message: MaintenanceRef,
+    /// 修正后的完整正文。
+    pub content: Vec<crate::types::Block>,
+    /// 修正后的编辑标记；null 表示清除旧的错误标记。
+    pub edited_at_ms: Option<i64>,
+    /// 是否仍有翻译不了的内容。
+    pub incomplete: bool,
+}
+
+/// `messages/maintain` 结果，只能引用请求里的编号且每条最多一次。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceResult {
+    /// Repair 模式下发生变化的消息；不变的省略。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub updates: Vec<MaintenanceUpdate>,
+    /// Reread 模式下需要重新读取的消息；不符合条件的不写永久完成记录。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reread: Vec<MaintenanceRef>,
+}
+
 /// `reactions/list` / `messages/send` 等用到的发送结果别名。
 pub type SendResult = SendOutcome;
 
@@ -1962,6 +2026,26 @@ pub struct CancelParams {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn maintenance_shapes_round_trip_and_updates_explicitly_replace_flags() {
+        use serde_json::json;
+        let params = json!({"mode": "repair", "rule": "old-text-v1", "messages": []});
+        let parsed: MaintenanceParams = serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), params);
+        let result = json!({"updates": [{"conversationId": "c", "id": "m", "content": [{"type": "text", "text": "fixed"}], "editedAtMs": null, "incomplete": false}]});
+        let parsed: MaintenanceResult = serde_json::from_value(result.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), result);
+        assert_eq!(
+            serde_json::to_value(MaintenanceResult::default()).unwrap(),
+            json!({})
+        );
+        assert!(
+            serde_json::from_value::<MaintenanceParams>(
+                json!({"mode": "future", "rule": "r", "messages": []})
+            )
+            .is_err()
+        );
+    }
 
     // 契约 provider-protocol v14：登录方式的默认中继、App Secret 的说明、相对的回调路径都可选、原样往返。
     #[test]
@@ -1989,6 +2073,7 @@ mod tests {
             Method::ConversationsFindDirect,
             Method::MessagesRetranslate,
             Method::EventsPush,
+            Method::MessagesMaintain,
             Method::Cancel,
         ] {
             assert_eq!(Method::from_name(m.as_str()), Some(m));
@@ -2148,12 +2233,19 @@ mod tests {
         let with = json!({ "conversationId": "C1", "kind": "channel", "firstMs": 1, "latestMs": 2,
             "conversation": { "id": "C1", "kind": "channel", "name": "general", "private": true } });
         let item: ActivityItem = serde_json::from_value(with.clone()).unwrap();
-        assert_eq!(item.conversation.as_ref().map(|c| c.name.as_str()), Some("general"));
+        assert_eq!(
+            item.conversation.as_ref().map(|c| c.name.as_str()),
+            Some("general")
+        );
         assert_eq!(serde_json::to_value(&item).unwrap(), with);
         let old = json!({ "conversationId": "D1", "kind": "direct", "firstMs": 1, "latestMs": 2, "peerId": "U1" });
         let item: ActivityItem = serde_json::from_value(old.clone()).unwrap();
         assert_eq!(item.conversation, None);
-        assert_eq!(serde_json::to_value(&item).unwrap(), old, "旧形状写回不多出键");
+        assert_eq!(
+            serde_json::to_value(&item).unwrap(),
+            old,
+            "旧形状写回不多出键"
+        );
     }
 
     // 契约 provider-protocol v13：新方法名原样往返。

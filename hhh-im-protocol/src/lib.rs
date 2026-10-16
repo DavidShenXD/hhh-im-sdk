@@ -75,6 +75,12 @@ pub mod budget {
     pub const RAW_MAX_BYTES: usize = 256 * 1024;
     /// 一次 `messages/retranslate` 最多几条。
     pub const RETRANSLATE_BATCH_MAX: usize = 100;
+    /// 一次已存消息维护最多几条。
+    pub const MAINTENANCE_BATCH_MAX: usize = 100;
+    /// 一次维护请求的消息 JSON 预算，给信封与返回的修正留出空间。
+    pub const MAINTENANCE_BYTES_MAX: usize = MESSAGE_MAX_BYTES / 2;
+    /// 每种消息维护规则最多几条。
+    pub const MAINTENANCE_RULES_MAX: usize = 64;
     /// 日志行、`log/write` 的 message 截断到多少字节。
     pub const LOG_LINE_MAX_BYTES: usize = 4 * 1024;
     /// 一个插件最多声明几种登录方式（契约 provider-protocol v12 缺口 6）。

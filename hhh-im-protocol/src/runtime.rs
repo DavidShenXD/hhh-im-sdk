@@ -47,6 +47,8 @@ mod log;
 pub mod metering;
 mod segments;
 mod uploads;
+#[cfg(target_os = "wasi")]
+mod wasi_stdio;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -115,6 +117,10 @@ pub trait Plugin: Send + Sync + 'static {
 
 /// 用标准输入、标准输出跑协议服务，直到宿主关掉标准输入。日志要交给宿主时，先调 [`install_log`]
 /// （拿 [`serve_stdio_with`] 给的 [`Host`]）。
+///
+/// 编 iPhone / iPad 用的 WASM 包（`wasm32-wasip2`，契约 provider-protocol v18）时插件代码不用改：标准输入输出自动改走
+/// WASI 的接口。没内容可读时按计时醒来看（tokio 在 WASI 上等不了标准输入），空闲后第一条请求至多晚 16 毫秒。
+/// 用到 tokio 的网络、文件等能力的插件编 WASM 包时要带 `RUSTFLAGS="--cfg tokio_unstable"`。
 pub async fn serve_stdio<P: Plugin>(plugin: P) {
     serve_stdio_with(plugin, |_| {}).await;
 }
@@ -123,14 +129,26 @@ pub async fn serve_stdio<P: Plugin>(plugin: P) {
 pub async fn serve_stdio_with<P: Plugin>(plugin: P, ready: impl FnOnce(&Host)) {
     let (host, writes) = Host::new();
     ready(&host);
-    run(
-        Arc::new(plugin),
-        host,
-        tokio::io::stdin(),
-        tokio::io::stdout(),
-        writes,
-    )
-    .await;
+    serve_stdio_on(Arc::new(plugin), host, writes).await;
+}
+
+/// 同 [`serve_on`]，用标准输入输出（WASM 包上同 [`serve_stdio`] 自动改走 WASI 的接口）：插件要先建好 [`Host`]、
+/// 插件本身要拿着它（推送用）时用这个。
+pub async fn serve_stdio_on<P: Plugin>(plugin: Arc<P>, host: Host, writes: Writes) {
+    let (input, output) = stdio();
+    run(plugin, host, input, output, writes).await;
+}
+
+/// 这个目标上的标准输入与标准输出。
+#[cfg(not(target_os = "wasi"))]
+fn stdio() -> (tokio::io::Stdin, tokio::io::Stdout) {
+    (tokio::io::stdin(), tokio::io::stdout())
+}
+
+/// 这个目标上的标准输入与标准输出：WASI 上 tokio 自带的用不了，走 WASI 的接口。
+#[cfg(target_os = "wasi")]
+fn stdio() -> (wasi_stdio::Stdin, wasi_stdio::Stdout) {
+    (wasi_stdio::Stdin::new(), wasi_stdio::Stdout)
 }
 
 /// 在给定的输入、输出上跑协议服务（测试用内存里的管道），直到输入读完。

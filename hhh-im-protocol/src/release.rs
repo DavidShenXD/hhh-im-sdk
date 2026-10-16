@@ -1,4 +1,4 @@
-//! 插件安装包与版本发布（契约 provider-protocol v10 §4.1–§4.3）：安装包给哪种电脑（[`Target`]）、清单里的更新来源
+//! 插件安装包与版本发布（契约 provider-protocol v10 §4.1–§4.3、v18）：安装包给哪种电脑（[`Target`]）、清单里的更新来源
 //! （[`Source`]）、版本号比大小（[`Version`]）、每个版本附带的版本索引（[`ReleaseIndex`]）。
 //!
 //! 宿主（检查更新、下载、核对）、打包工具与插件仓库模板共用这一份：
@@ -26,6 +26,9 @@ pub const PACKAGES_MAX: usize = 8;
 pub const LOGO_DATA_MAX_BYTES: usize = 96 * 1024;
 
 /// 安装包给哪种电脑（系统 + 芯片）。ARM 芯片的 Windows 也运行 x64 的包。
+///
+/// iPhone / iPad 不能运行下载来的原生程序，它的包是 WASM 组件（[`Target::Wasm32Wasip2`]），由 App 自己解释执行；
+/// 桌面各系统照旧只用原生程序的包（契约 provider-protocol v18）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Target {
     /// Windows（x64；ARM 芯片的 Windows 也用它）。
@@ -43,16 +46,20 @@ pub enum Target {
     /// ARM 的 Linux。
     #[serde(rename = "linux-arm64")]
     LinuxArm64,
+    /// iPhone / iPad：WASM 组件（`wasm32-wasip2`），App 进程里解释执行。
+    #[serde(rename = "wasm32-wasip2")]
+    Wasm32Wasip2,
 }
 
 impl Target {
     /// 全部目标。
-    pub const ALL: [Target; 5] = [
+    pub const ALL: [Target; 6] = [
         Target::WindowsX64,
         Target::MacosArm64,
         Target::MacosX64,
         Target::LinuxX64,
         Target::LinuxArm64,
+        Target::Wasm32Wasip2,
     ];
 
     /// 写进包名、清单与索引的名字。
@@ -72,6 +79,7 @@ impl Target {
             Target::MacosX64 => "macos-x64",
             Target::LinuxX64 => "linux-x64",
             Target::LinuxArm64 => "linux-arm64",
+            Target::Wasm32Wasip2 => "wasm32-wasip2",
         }
     }
 
@@ -88,6 +96,7 @@ impl Target {
             Target::WindowsX64 => "windows",
             Target::MacosArm64 | Target::MacosX64 => "macos",
             Target::LinuxX64 | Target::LinuxArm64 => "linux",
+            Target::Wasm32Wasip2 => "ios",
         }
     }
 
@@ -99,7 +108,13 @@ impl Target {
             Target::MacosX64 => "Intel 芯片的 Mac",
             Target::LinuxX64 => "Linux（x86）",
             Target::LinuxArm64 => "Linux（ARM）",
+            Target::Wasm32Wasip2 => "iPhone / iPad",
         }
+    }
+
+    /// 这个目标的包装的是不是 WASM 组件（不是原生程序）。
+    pub fn is_wasm(self) -> bool {
+        matches!(self, Target::Wasm32Wasip2)
     }
 
     /// 这台电脑该用哪个目标的包；编译到不认识的平台时为空。
@@ -115,10 +130,13 @@ impl Target {
     /// use hhh_im_protocol::release::Target;
     /// assert_eq!(Target::for_platform("windows", "aarch64"), Some(Target::WindowsX64));
     /// assert_eq!(Target::for_platform("macos", "aarch64"), Some(Target::MacosArm64));
+    /// assert_eq!(Target::for_platform("ios", "aarch64"), Some(Target::Wasm32Wasip2));
     /// assert_eq!(Target::for_platform("freebsd", "x86_64"), None);
     /// ```
     pub fn for_platform(os: &str, arch: &str) -> Option<Target> {
         match (os, arch) {
+            // 真机与模拟器都用 WASM 包：与芯片无关。
+            ("ios", _) => Some(Target::Wasm32Wasip2),
             ("windows", "x86_64" | "aarch64") => Some(Target::WindowsX64),
             ("macos", "aarch64") => Some(Target::MacosArm64),
             ("macos", "x86_64") => Some(Target::MacosX64),
@@ -437,8 +455,31 @@ pub struct ReleaseIndex {
     /// 更新说明（Markdown，给用户看）。
     #[serde(default)]
     pub notes: String,
-    /// 各目标的包。
+    /// 各目标的包。读的时候跳过这个宿主不认识的目标（以后加的系统），其余照常（契约 provider-protocol v18 D2）：
+    /// 旧版宿主读得了带新目标的索引。签名核对的是索引原文，不受影响。
+    #[serde(deserialize_with = "known_packages")]
     pub packages: Vec<ReleasePackage>,
+}
+
+/// 读 `packages`：目标认得出的按 [`ReleasePackage`] 严格读，认不出的整项跳过（它的字段可能是以后的写法）。
+fn known_packages<'de, D>(deserializer: D) -> Result<Vec<ReleasePackage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    let mut packages = Vec::with_capacity(raw.len());
+    for value in raw {
+        let target = value.get("target").and_then(serde_json::Value::as_str);
+        if target.is_some_and(|name| Target::parse(name).is_none()) {
+            tracing::info!(
+                package_target = target.unwrap_or_default(),
+                "版本索引里有这个 HHH 不认识的目标，跳过这个包"
+            );
+            continue;
+        }
+        packages.push(serde_json::from_value(value).map_err(serde::de::Error::custom)?);
+    }
+    Ok(packages)
 }
 
 /// 只是一个文件名：没有路径符号、不以点开头。
@@ -599,6 +640,65 @@ mod tests {
         );
         assert_eq!(Target::for_platform("windows", "x86"), None);
         assert!(Target::host().is_some(), "开发与测试的电脑都该认得出");
+    }
+
+    /// iPhone / iPad（真机与模拟器）用 WASM 包：系统写 ios、给人看叫 iPhone / iPad；桌面各系统都不是它。
+    #[test]
+    fn iphones_use_the_wasm_package_and_desktops_never_do() {
+        assert_eq!(
+            Target::for_platform("ios", "aarch64"),
+            Some(Target::Wasm32Wasip2)
+        );
+        assert_eq!(
+            Target::for_platform("ios", "x86_64"),
+            Some(Target::Wasm32Wasip2)
+        );
+        let wasm = Target::Wasm32Wasip2;
+        assert_eq!(
+            (wasm.as_str(), wasm.os(), wasm.label()),
+            ("wasm32-wasip2", "ios", "iPhone / iPad")
+        );
+        assert!(wasm.is_wasm());
+        for target in Target::ALL {
+            assert_eq!(target.is_wasm(), target.os() == "ios");
+        }
+        assert_ne!(
+            Target::host(),
+            Some(Target::Wasm32Wasip2),
+            "桌面不选 WASM 包"
+        );
+    }
+
+    /// 版本索引里有不认识的目标（以后加的系统，字段也可能是新写法）：那一项跳过，认得出的照常读；
+    /// 认得出的目标写错了照旧整份报错。
+    #[test]
+    fn unknown_targets_in_a_release_index_are_skipped() {
+        let sha = "a".repeat(64);
+        let text = format!(
+            r#"{{"indexVersion":1,"id":"demo-im","version":"0.2.0","packages":[
+              {{"target":"plan9-risc","file":"demo-im-0.2.0-plan9-risc.hhhim","size":1,"sha256":"{sha}","future":true}},
+              {{"target":"macos-arm64","file":"demo-im-0.2.0-macos-arm64.hhhim","size":2,"sha256":"{sha}"}},
+              {{"target":"wasm32-wasip2","file":"demo-im-0.2.0-wasm32-wasip2.hhhim","size":3,"sha256":"{sha}"}}]}}"#
+        );
+        let index: ReleaseIndex = serde_json::from_str(&text).unwrap();
+        assert!(index.check().is_ok());
+        assert_eq!(
+            index
+                .packages
+                .iter()
+                .map(|package| package.target)
+                .collect::<Vec<_>>(),
+            [Target::MacosArm64, Target::Wasm32Wasip2]
+        );
+        assert_eq!(index.package_for(Target::Wasm32Wasip2).unwrap().size, 3);
+        let broken = text.replace(r#""size":2,"#, r#""size":2,"extra":1,"#);
+        assert!(serde_json::from_str::<ReleaseIndex>(&broken).is_err());
+        let only_unknown = format!(
+            r#"{{"indexVersion":1,"id":"demo-im","version":"0.2.0","packages":[
+              {{"target":"plan9-risc","file":"x.hhhim","size":1,"sha256":"{sha}"}}]}}"#
+        );
+        let index: ReleaseIndex = serde_json::from_str(&only_unknown).unwrap();
+        assert!(index.check().unwrap_err().contains("没有安装包"));
     }
 
     #[test]

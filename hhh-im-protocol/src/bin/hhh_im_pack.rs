@@ -6,7 +6,8 @@
 //! hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--sign-key <私钥文件>] [--publish]
 //! hhh-im-pack keygen <放钥匙的文件夹>
 //! ```
-//! - `--target`：`windows-x64`、`macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64`；不写用这台电脑的目标。
+//! - `--target`：`windows-x64`、`macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64`，iPhone / iPad 用 `wasm32-wasip2`；
+//!   不写用这台电脑的目标。
 //! - `--out`：包与索引放哪，默认插件文件夹下的 `dist/`。
 //! - `--notes`：更新说明（Markdown 文件）；不写时沿用输出文件夹里同一版本索引已有的说明。
 //! - `--tag`：发布用的标签，必须是 `v<清单版本>`，不一致就不打。

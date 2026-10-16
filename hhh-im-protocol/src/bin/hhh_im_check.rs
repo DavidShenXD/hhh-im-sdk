@@ -290,6 +290,40 @@ async fn run(args: Args) -> i32 {
         );
     }
     check_v12_declarations(&mut report, &manifest, &platform, &init);
+    match platform.check_maintenance(&caps) {
+        Ok(()) if caps.message_maintenance => {
+            report.pass("旧消息维护声明合法");
+            for (mode, rules) in [
+                ("repair", &platform.content_repairs),
+                ("reread", &platform.content_rereads),
+            ] {
+                for rule in rules {
+                    let check = format!("旧消息维护 {mode}/{rule} 可调用");
+                    match call_t(
+                        &conn,
+                        "messages/maintain",
+                        json!({"mode": mode, "rule": rule, "messages": []}),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    {
+                        Ok(value) => match serde_json::from_value::<
+                            hhh_im_protocol::method::MaintenanceResult,
+                        >(value)
+                        {
+                            Ok(result) if result.updates.is_empty() && result.reread.is_empty() => {
+                                report.pass(&check)
+                            }
+                            _ => report.fail(&check, "空消息维护必须返回空结果"),
+                        },
+                        Err(error) => report.fail(&check, error),
+                    }
+                }
+            }
+        }
+        Ok(()) => report.skip("旧消息维护", "未声明可选能力"),
+        Err(error) => report.fail("旧消息维护声明合法", error),
+    }
     check_v13_declarations(&mut report, &init);
 
     // 4. session/open。

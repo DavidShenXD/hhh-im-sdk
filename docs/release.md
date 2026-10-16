@@ -16,9 +16,14 @@ HHH 只从插件清单 `source` 写的仓库检查、下载新版本，只读一
 ## 2. 安装包 `.hhhim`
 
 - 就是一个 zip，最上层是清单 `hhh-im-provider.json`，其余文件按清单里的相对路径放。
-- 一个包只给一种电脑：`windows-x64`（ARM 的 Windows 也用它）、`macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64`。
+- 一个包只给一种设备：`windows-x64`（ARM 的 Windows 也用它）、`macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64`，
+  以及 iPhone / iPad 的 `wasm32-wasip2`（清单 `os` 写 `ios`）。
 - 包名 `<插件编号>-<版本>-<目标>.hhhim`，如 `wechat-pad-0.4.0-windows-x64.hhhim`。
-- 清单的 `command` 不写扩展名时，打 Windows 包会自动指向 `<command>.exe`，同一份清单能打各系统的包。
+- 清单的 `command` 不写扩展名时，打 Windows 包会自动指向 `<command>.exe`、打 `wasm32-wasip2` 包指向 `<command>.wasm`，
+  同一份清单能打各种设备的包。
+- `wasm32-wasip2` 包里放编成 WASM 组件的程序（`cargo build --release --target wasm32-wasip2`），iPhone / iPad 上的 HHH
+  在 App 里运行它：照常经标准输入输出说协议（插件运行时 `serve_stdio_on` 已在 WASI 上接好），能连网络（TCP、域名解析），
+  只看得到自己的临时目录，不能起子进程、不能开监听端口、没有组播。
 - HHH 解包时拒绝绝对路径、`..`、链接，以及超过 1 万个文件或解压后 1 GB 的包。
 
 ## 3. 发一个版本
@@ -28,6 +33,8 @@ HHH 只从插件清单 `source` 写的仓库检查、下载新版本，只读一
 3. 每台要出包的电脑上：`hhh-im-pack <插件文件夹> --target <目标> --notes notes.md --publish`。
    - 新版本要比仓库里最新的正式版本大；同一版本补传别的目标可以。
    - 仓库里同一版本已有的索引会先合进来，几台电脑各打各的目标，索引里就有全部目标。
+   - HHH 只读最新正式版本的索引：这一版没出某种设备的包，这种设备上已装的停在旧版、没装的从仓库装不上；
+     之后给同一版本补传这个目标就好。
    - 令牌放环境变量 `HHH_IM_PUBLISH_TOKEN`（GitHub 也认 `GITHUB_TOKEN`，GitLab 也认 `GITLAB_TOKEN`），不写进任何文件。
      GitHub 用能写 Contents 的令牌；GitLab 用带 `api` 的个人访问令牌。
 

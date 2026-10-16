@@ -3,6 +3,8 @@
 > 状态：draft，随 [contract-v1](contract-v1.md) 一起确认。日期：2026-10-04。
 > 本文规定宿主（HHH）与外部 IM 程序之间交换什么。程序内部怎么写，见[通用实现范式](provider-guide-v1.md)。
 
+接入范围以当前宿主实现的声明和方法为准。新平台使用这些能力，只需提供插件程序、清单与安装包，不登记到 Friend 或 hhh-im；超出范围的能力须先扩展通用协议和宿主实现。SDK 的包版本与线上协议主版本是两件事，不能仅凭 SDK 已提供某个类型就认定所有宿主已支持它。
+
 ## 0. 术语
 
 - **宿主**：HHH。具体由 hhh-im 的“外部程序适配器”实现，Friend 负责装配。
@@ -44,16 +46,16 @@
 | 字段 | 规则 |
 |---|---|
 | `manifestVersion` | 清单格式的版本，现在是 1 |
-| `id` | 程序编号：以小写字母开头，只含 `a-z0-9-`，长 2–32 个字符。宿主内部使用的平台编号由宿主定（一般是 `ext-<id>`），因此永远不会和内置平台（`feishu`、`slack`）或已下线的平台（`wechat`）撞名；程序不用知道这个编号（v14 起回调路径写相对路径，见 §6.1a）。同一个编号只能装一个程序。例外（v12，v13 改写）：编号在宿主的官方列表里的程序（保留编号）只认官方签名；其中有同编号内置平台的，平台编号就是这个编号，装上后顶替这个内置平台（附录 D），没有内置平台的平台编号照常是 `ext-<id>` |
+| `id` | 程序编号：以小写字母开头，只含 `a-z0-9-`，长 2–32 个字符。普通插件的平台编号为 `ext-<id>`；带官方签名的保留编号按官方目录的平台编号映射，旧平台沿用原编号，以连接已有历史与关注。同一个编号只能装一个程序；回调路径可写相对路径（§6.1a），程序不必推断宿主编号。宿主不再提供内置平台实现，旧账号交接见附录 D |
 | `name` | 给用户看的平台名，1–20 个字符 |
 | `version` | 程序版本，semver 写法 |
 | `command` / `args` | 启动命令。`command` 按清单所在目录解析相对路径，也可以是 PATH 里能找到的程序（如 `node`、`python`）；`args` 原样传入 |
 | `os` | 支持的系统：`windows` / `macos` / `linux`。当前系统不在列表里时不能添加 |
 | `logo` | 可选。SVG、PNG、JPG 或 WebP，不超过 256 KiB，路径相对清单所在的文件夹、不能走出这个文件夹。没有 logo 时，宿主用名字的第一个字画一个 |
-| `logoStyle` | 可选（v12）。`icon`（默认）：logo 是一张完整的应用图标，宿主原样画；`mark`：logo 是透明底的标志图形，宿主垫自己的底色与外框（同内置飞书、Slack） |
+| `logoStyle` | 可选（v12）。`icon`（默认）：logo 是一张完整的应用图标，宿主原样画；`mark`：logo 是透明底的标志图形，宿主垫自己的底色与外框 |
 | `logoInk` | 可选（v12）。`{x, y, width, height}`：标志图形在画布里实际占的那一块（按 logo 自己的坐标），宿主据此居中、缩放。四个数要是有限数，宽、高大于 0 |
 | `publisher` / `homepage` | 可选。添加时展示给用户 |
-| `imType` | 可选（v5）。IM 类型，规则同 `id`。内置飞书是 `feishu`、内置 Slack 是 `slack`；写成同一个值就和它们是同一种，宿主里同一种同一时间只用一个。不写时自成一类、不和任何 IM 互斥。只认这个字段，插件编号碰巧同名不算同一种 |
+| `imType` | 可选（v5）。IM 类型，规则同 `id`；相同值表示同一种，宿主里同一种同一时间只用一个。不写时自成一类、不和其他 IM 互斥。类型只认这个字段，不从插件编号推断 |
 | `source` | 可选（v10）。更新来源：`{"type":"github","repo":"<owner>/<name>"}`、`{"type":"gitlab","host":"https://<站点>","project":"<group>/<name>"}`、`{"type":"url","index":"https://…/hhhim-release.json"}` 之一。不写就没有更新来源。写了时 `version` 必须是 `主.次.修订` 三段数字。宿主只接受同一来源、同一编号的更新 |
 | `minHost` | 可选（v10）。需要的最低 HHH 版本（`主.次.修订`）；HHH 更旧时不给装、不给更新 |
 | `target` | 可选（v10）。这个包给哪种电脑，打包工具按 `--target` 写进包里的清单，不用手写。从安装包装时必须有且是本机；文件夹装时可以没有，照旧按 `os` 判断 |
@@ -125,14 +127,14 @@
 ```
 
 - `credentialReadOnly`（可选，v12）：这份凭据是借来的、只能用（例如隔离测试环境借用户本人的）。为真时程序不得换新凭据、不得调 `credential/save`（宿主一律回错误），到期就发 `session/expired`。不带即为假。
-- `legacy`（可选，v12）：同编号的内置平台留下的授权与设置，只在程序还没有自己的凭据时交一次，格式见附录 D。
+- `legacy`（可选，v12）：旧内置平台留下的授权与设置，程序还没有自己的凭据且交接未完成时可再次收到，格式见附录 D。
 
 结果是下面两种之一：
 
 - `{ "state": "online", "account": Account, "adoptedSettings"?: { "parameters"?: { "<设置项编号>": "<值>" }, "login"?: { "method", "values" } } }`
 - `{ "state": "needsLogin", "reason": "noCredential|expired|revoked|credentialInvalid", "message": "<给用户看的说明>" }`
 
-`adoptedSettings`（可选，v12）：接过 `legacy` 时，请宿主写进这个程序设置项（§6.4）的值与“现在在用”的登录方式（§6.1a）。宿主只在程序在线、并且回 `online` 时已经用 `credential/save` 存好自己的凭据，才删掉内置平台那份授权并写入这些设置；否则内置那份不动，程序还没有自己的凭据时下次打开再交。
+`adoptedSettings`（可选，v12）：请宿主写入程序参数（§6.4）与当前登录方式（§6.1a）。接过 `legacy` 的程序应把这些选择留在自己的不透明凭据中；此后普通 `session/open` 成功时仍可返回，便于恢复“凭据已保存、设置尚未保存就中断”的交接。宿主只在在线、凭据已持久保存、参数与登录选择都写入后才删除旧栏；任一步失败保留原件并重试。只读借用时不删除来源凭据或旧栏，也不保存交接选择。
 
 规则：
 
@@ -173,6 +175,8 @@
 | `discovery` | `{fastestSecs, pages, coldPages}` | 否 | v12。会话发现：宿主定时问程序一段时间里有人发过消息的会话（`conversations/recentActivity`，§8），把不在列表里的加进会话列表。`fastestSecs` 是最快多久问一次，`pages` / `coldPages` 是平常与刚启动时一次最多翻几页。要同时声明能力 `conversations.recentActivity` 才生效 |
 | `editsByContent` | 字符串数组 | 否 | v12。平台不给“改过”标记时，宿主按内容认编辑：这里列出的内容块种类（`text`、`mention`、`rich`）真变了、时间往后才算编辑过。不写就只认 `editedAtMs` |
 | `retranslateRules` | `[{name, formats?}]` | 否 | v12。程序现在的翻译规则名，按顺序（§10.1）。`formats` 给了就只把 `raw.format` 在其中的旧消息交给这条规则。至多 32 条，名字不能重复 |
+| `contentRepairs` | 字符串数组 | 否 | 一次性本地修正规则名，按依赖顺序执行（§10.2），须同时声明 `messageMaintenance` |
+| `contentRereads` | 字符串数组 | 否 | 视野内旧消息的重读判定规则名（§10.2），须同时声明 `messageMaintenance` |
 | `threads` | 对象或 null | 否 | 平台有话题时给：`{activityOnRoot, readsAfter, broadcast: {native, attachments} 或 null}`，含义同 hhh-im `Platform` 里的同名项 |
 | `deletedMessagesVanish` | 布尔 | 否 | 撤回的消息直接从历史里消失（而不是留下“已撤回”标记）时为真。默认假 |
 | `reactionsInReads` | 布尔 | 否 | 读消息时会随消息带回完整的表情。默认假 |
@@ -180,7 +184,7 @@
 | `actions` | 见下文 | 是 | 每条消息允许哪些操作 |
 | `emoji` | `{namePattern, unlisted: {placeholderPattern, placeholderLabel, guess?, guessPattern?}, textPattern?, whiteBackground?}` | 有表情能力时必需 | 表情编号的规则（正则，JavaScript 语法；v14 起宿主照它核对点表情的编号），以及目录里没有的表情怎么显示（v14 起宿主照 `placeholderPattern`、`placeholderLabel` 画占位）。v12：`unlisted.guess` 为真时，目录外的表情类型也问 `emoji/image` 要图（§9.1），v14：`guessPattern` 给了就只拿合它的类型去问（猜不出的如飞书企业表情的纯数字编号不必每次问）；`textPattern` 是正文里表情的写法（JavaScript 正则，第一个括号是表情名，例如飞书的 `\[([^\[\]\r\n]{1,12})\]`），宿主把正文里这样写、目录里有这个名字的换成表情图，不写就不换；`whiteBackground` 为真时表情图是白底的，宿主显示前抠成透明 |
 
-`actions` 用声明式规则写，由宿主用通用代码执行。内置平台的这部分是 Rust 函数（`actions` / `edit_draft`），外部程序改用下面这种规则：
+`actions` 用下面的声明式规则写，由宿主用通用代码计算消息可用的操作：
 
 ```json
 {
@@ -226,6 +230,7 @@
 - v15：`people.bots` 为真时程序能按编号读机器人与应用（`people/get` 的 `bots`），要先声明 `people.get`；不写时宿主把机器人一律记成“没有”、不为它们问程序。`people.batchMax`（1–2000）是一次 `people/get` 最多问几个，平台一次读一大批更省时写（如读一遍整份成员名单就认出一大批人）；不写是 100。
 
 - `retranslate` 为真时，程序随消息附带去凭据化的原始数据（§7.4 的 `raw`），宿主存一张原始数据表；程序翻译规则升级后，宿主调 `messages/retranslate`（§10.1）让它把本地旧消息重新翻译一遍。为假时不附带原始数据、也不会被调用重译。
+- `messageMaintenance`（可选，默认假）允许宿主把已存的统一消息交给程序做本地修正或重读判定，不依赖 `raw`，不替代 `retranslate`。旧程序省略此能力照常接入。
 
 - **只读连接**：`send` 为 null，或者其中各项都是 false。宿主不显示输入框，伙伴不在这个连接上回复，所有发送请求都在本地直接拒绝。
 - `history=server` 时，`messages.list` 必须为真。`history=none` 时，`events.messages` 必须为真。
@@ -258,7 +263,7 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 - 同一时间只有一个登录流程。新的 `login/start` 会取消还没结束的旧流程。
 - 需要浏览器授权回调（OAuth）的，有两种做法：程序自己在本机回环地址上监听，并把这个地址写进 `openUrl` 步骤里；或者（v12）在登录方式里声明 `callbackPath`，由宿主在本机地址上收（§6.1a）。
 - 程序必须在收到 `credential/save` 的成功回复之后，才能发 `login/finished`。
-- `openUrl` 一步到了，宿主自动打开它（桌面版在授权窗口里，网页版新标签），登录框里的次按钮（文字用 `label`）能再打开一次；登录结束后宿主关掉授权窗口（v12）。
+- `openUrl` 一步到了，宿主自动打开它（桌面版交给系统默认浏览器，网页版新标签），登录框里的次按钮（文字用 `label`）能再打开一次（v12）；打开的登录页宿主不关，登录结束后由用户关（friend/im-auth-relay v8 起，此前桌面版在授权窗口里、结束后关窗）。
 
 ### 6.1a 登录方式（v12，可选）
 
@@ -528,6 +533,21 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 - 结果：`{ "messages": [ Message… ] }`，每条是重译后的完整消息；程序不想改的那条可以原样返回，宿主按消息编号覆盖本地记录。
 - `rule` 由程序自己定名（例如 `wechat-miniapp-card-v2`），写在平台说明的 `retranslateRules` 里（v12，§5.1）。宿主每次打开时按顺序看：存着原始数据、`format` 对得上（规则写了 `formats` 时）、这个规则还没做过的旧消息，每批至多 100 条交给它；按规则名记“这条已经用这个规则重译过”，同一规则不重复重译；程序换了新规则名才会再被调。不联网、不占平台读取额度；这一批出错不记，下次打开再试。这对应 hhh-im 现有的 `content_rereads` 机制，区别是数据来自程序的 `raw` 而不是平台重读。
 
+### 10.2 messages/maintain（宿主→程序，需要 `messageMaintenance` 能力）
+
+用于没有 `raw` 的旧消息。程序只做纯计算，不联网、不写消息库；线上类型仍是 §7 的 `Message`，不传宿主落库格式、连接编号或凭据。
+
+- 请求：`{ "mode": "repair" | "reread", "rule": "旧规则名", "messages": [Message…] }`。`repair` 的规则须在 `contentRepairs`，`reread` 的须在 `contentRereads`。
+- `repair` 结果：`{ "updates": [{ "conversationId", "id", "content": [Block…], "editedAtMs": null | 整数, "incomplete": 布尔 }] }`。只返回要改的消息；正文是完整替换，编辑标记与不完整标记显式给出（`null` 清除旧的错误编辑标记）。其余发送者、引用、话题、原始数据、编辑原文由宿主保留，未改动正文节点的身份与资源来源也保留。
+- `reread` 结果：`{ "reread": [{ "conversationId", "id" }] }`。只判定哪些需要向平台重读，宿主随后调用 `messages/get`；不符合条件的不写永久完成标记。
+- 不得混用两类结果、返回未请求的消息、重复编号或未知内容类型；空结果为 `{}`。超限报 `limitExceeded`，不截断单条正文或返回半份结果。
+
+规则名沿用旧版已发布名字，以便识别已有完成记录；每组至多 64 条，名字 1–128 个 ASCII 字母、数字、`-_.`，组内不重复，重读名不能与 `retranslateRules` 同名。`repair:` 前缀保留给宿主的恢复进度，任何重译规则也不得占用。
+
+宿主按规则顺序分批处理；每批在数据库锁外请求，短事务核对原快照后同时保存正文与本批进度，失败不推进，重开接着做。一次性修正会扫描尚未完成的旧记录，正常消息读取不做此扫描。单条超过线上预算时保留原样，本次暂缓它的后续规则与重读，其它消息继续；暂缓不算成功，下次打开重试。
+
+降级兼容：维护开始前，宿主同事务给整组未完成规则写旧版认识的跳过标记与新版进行中标记。旧版打开时暂停这一组，不能打乱依赖顺序；新版以进行中标记为准，完成后才清理逐条进度并记录最终统计。已有旧完成标记而没有进行中标记的规则永不重做。
+
 ## 11. 推送
 
 ### 11.1 events/push（程序→宿主请求）
@@ -569,7 +589,7 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 
 - 推送是消息的唯一来源。宿主不会定时去读消息，也不会往上翻页补读断档，本地最早的那条就是尽头。
 - 程序要把平台的同步位置（例如微信的同步游标）放进每一批的 `syncState`。宿主把它和这一批消息一起存进本地库，下次 `session/open` 时交还给程序，程序从那里接着拉。宿主保证：本地库里保存的 `syncState` 之前的所有事件，都已经写进了本地库。
-- 这类平台**所有会话的消息都存进 HHH**，不按同步范围丢弃（HHH 已经不再有“先关注再接收”这一步）。宿主收到某个还没在侧栏出现的会话的推送时，存库并走“发现会话”的路径让它出现在侧栏——和内置平台里会话因为来了新消息而出现是同一套表现。否则这条消息只推一次，丢了就再也拿不到。
+- 这类平台**所有会话的消息都存进 HHH**，不按同步范围丢弃（HHH 已经不再有“先关注再接收”这一步）。宿主收到某个还没在侧栏出现的会话的推送时，存库并走“发现会话”的路径让它出现在侧栏——沿用其他平台的新会话发现表现。否则这条消息只推一次，丢了就再也拿不到。
 - 会话清单靠 `conversation` 事件推送过来，存进本地库，按名字搜索会话在 HHH 本地完成。
 
 ### 11.5 log/write（程序→宿主通知，不需要确认）
@@ -648,6 +668,7 @@ JSON-RPC 的 `error.code` 按下表取值；`error.data` 里写明错误分类�
 | 凭据 | 64 KiB |
 | 单条消息的 `raw` 原始数据 | 256 KiB |
 | 一次 `messages/retranslate` | 100 条 |
+| 一次 `messages/maintain` | 100 条，请求参数及结果各不超过 2 MiB；仍受 4 MiB JSON-RPC 帧上限约束 |
 | 日志行、`log/write` 的 `message` | 截到 4 KiB |
 | 登录方式（v12） | 至多 8 种；每段文字（叫法、说明、灰字、链接文字）至多 200 字 |
 | 登录时填的每个值、回调地址（v12） | 8 KiB |
@@ -734,9 +755,10 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 | `uploads/*` | `ImClient::upload_resource` |
 | `events/push` | `ImClient::live` → `LiveFeed`（新增：写进本地库后才确认） |
 | `messages/retranslate` | `ImClient::content_rereads` → `ContentReread`（新增：数据来自程序的 `raw`，不联网） |
+| `messages/maintain` | `ImClient::message_maintenance` / `maintain_messages`，统一消息的本地修正与重读判定 |
 | `log/write` | 宿主日志系统（新增：程序把结构化日志透给宿主） |
 | `login/*`、`credential/save`、`session/expired` | Friend 的授权和凭据保存（`StoreGrantBackend`）；外部程序走一套通用流程 |
-| `conversations/recentActivity`（v12） | `ImClient::recent_activity`（会话发现，同内置飞书、Slack） |
+| `conversations/recentActivity`（v12） | `ImClient::recent_activity`（会话发现） |
 | `session/notice`、`session/renew`、`login/callback`（v12） | Friend 的插件卡问题行、插件续期任务、本机回调路由 |
 
 协议的线上类型和 hhh-im 的内部类型分开定义、分开冻结，由适配器在两边之间翻译。这样内部模型怎么改，都不会影响已经发布的程序。协议里没有连接编号，`connection_id` 和 `ActorRef.id_type` 由适配器补上。
@@ -769,9 +791,9 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 
 （`→` 是宿主发给程序的，`←` 是程序发给宿主的。）
 
-## 附录 D：内置平台交给程序的授权（`hhh-builtin-v1`，v12）
+## 附录 D：旧内置账号交接（`hhh-builtin-v1`，v12）
 
-带官方签名、编号是保留编号的程序第一次打开、还没有自己的凭据，而同编号的内置平台登录着（授权没失效）时，宿主在 `session/open.legacy` 里交一次：
+带官方签名、编号是保留编号的程序还没有自己的凭据，而本机留有同编号的旧授权与设置时，宿主在 `session/open.legacy` 里交接。这里只读取旧格式，不启动旧平台客户端；交接未完成时可在下次打开重试：
 
 ```json
 { "format": "hhh-builtin-v1",
@@ -781,7 +803,7 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 
 - `credential` 是一段 JSON 文字：内置平台的访问令牌 `accessToken`、刷新令牌 `refreshToken`、访问令牌的过期时刻 `expiresAt`（Unix 秒）、权限 `scopes`，以及上次核验的账号 `account {id, name}`；内置平台没有的项为 null 或省略。
 - `settings` 是内置平台在 HHH 连接设置里的那一栏原样（各平台字段不同，如登录方式 `mode`、`appId`、`relayUrl`），其中存在系统凭据库里的密钥换成明文（如 `appSecret`），授权的引用去掉。密钥只经标准输入交这一次，宿主不写日志。
-- 程序接过后先用自己的格式经 `credential/save` 存凭据，收到宿主的成功回复之后再回 `online`（同 §6.3 先存后用），在 `online` 结果里用 `adoptedSettings`（§4.2）告诉宿主要写进它设置里的东西。宿主在程序回 `online` 时凭据已经存好，才删内置那份（连接设置那一栏与它引用的密钥）；没接成（没在线，或回 `online` 时还没存好）内置那份不动，程序还没有自己的凭据时下次打开再交——先回 `online`、后存凭据的程序，这一次不算接过，之后也不会再交。同一个编号同一时间只留一份在用的凭据；关注、本机消息与文件照旧（同编号共用一份本机数据）。
+- 程序先经 `credential/save` 保存自己的凭据，收到成功回复后再回 `online`，并用 `adoptedSettings`（§4.2）交回参数和登录设置。宿主确认凭据、参数与登录设置全部落盘后才删除旧引用；未完成则保留旧材料。插件已有凭据但设置交接中断时，可在普通 `session/open` 再返回 `adoptedSettings` 补齐；借用凭据时不转存、不删除来源。关注、本机消息与文件沿用同编号的数据。
 
 ## 变更记录
 

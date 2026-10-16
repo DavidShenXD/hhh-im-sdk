@@ -1,7 +1,10 @@
 //! 子进程 stdio 传输与连接层（protocol-v1 §3、§13）。
 //!
 //! - [`ProviderTransport`]：原始的「一行一条」收发抽象，便于测试注入进程内假插件。
-//! - [`StdioChild`]：按清单启动子进程，走它的 stdin/stdout，把 stderr 收成日志。
+//! - [`LinePipe`]：在一对字节流（插件的标准输入、标准输出）上收发一行一条，认出连续乱输出。子进程与 iPhone 上的
+//!   WASM 实例共用（契约 provider-protocol v18）。
+//! - [`PluginProcess`]：宿主管插件进程的接口（结束、是不是乱输出被结束的、停下并等它退出）。
+//! - [`StdioChild`]：按清单启动子进程，走它的 stdin/stdout，把 stderr 收成日志；它是 [`PluginProcess`] 的一种。
 //! - [`Connection`]：在传输之上做请求/响应按编号配对，并把插件主动发来的请求与通知交给宿主消费。
 
 use std::collections::HashMap;
@@ -11,7 +14,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::rpc::{RpcError, RpcId, RpcMessage, code, codec};
@@ -212,76 +215,49 @@ async fn read_loop(
 /// 标准输出连续这么多行不是合法消息，就当插件坏了：结束它、关掉连接（protocol-v1 §3）。
 pub const INVALID_LINES_MAX: usize = 3;
 
-/// 起插件进程的命令：三路管道、设 `HHH_IM_PROTOCOL=1`、工作目录为给定临时目录。
-fn plugin_command(
-    program: &str,
-    args: &[String],
-    cwd: &std::path::Path,
-) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args)
-        .current_dir(cwd)
-        .env(crate::ENV_FLAG, "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // 兜底：句柄真被丢弃时结束子进程。读输出的任务一直拿着句柄，平时靠宿主 `kill_now` / `shutdown` 结束它。
-        .kill_on_drop(true);
-    // Windows：按控制台程序编的插件（模板默认就是）被桌面宿主拉起时会弹出一个黑色控制台窗口；插件只经管道说话，
-    // 不要窗口（CREATE_NO_WINDOW）。
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd
+/// 宿主管一个插件进程的接口（契约 provider-protocol v18）：原生插件是子进程（[`StdioChild`]），iPhone 上是 App
+/// 里跑的 WASM 实例。宿主结束卡死的插件、说明它为什么断了、更新卸载前停下它，都只经这个接口。
+pub trait PluginProcess: Send + Sync + 'static {
+    /// 不等地叫它结束（同步，可在 `Drop` 里用）。正有别人在 [`Self::shutdown`] 时可以什么也不做（那边会结束它）。
+    fn kill_now(&self);
+    /// 是不是因为连续乱输出被结束的（宿主据此说明它为什么断了）。
+    fn garbled(&self) -> bool;
+    /// 结束它并等它退出：返回之后才能删它的程序文件（Windows 上运行中的程序删不掉）。
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
-/// 按清单启动子进程、走它 stdin/stdout 的传输（protocol-v1 §3）。stderr 每行交给回调（并入宿主日志）。
-pub struct StdioChild {
-    stdin: Mutex<tokio::process::ChildStdin>,
-    stdout: Mutex<tokio::io::Lines<BufReader<tokio::process::ChildStdout>>>,
-    child: Mutex<tokio::process::Child>,
+/// 插件的标准输出那一头：按行读。
+type LinesIn = tokio::io::Lines<BufReader<Pin<Box<dyn AsyncRead + Send>>>>;
+
+/// 一对字节流上的「一行一条」传输：宿主写插件的标准输入、读它的标准输出（protocol-v1 §3）。子进程与 WASM 实例共用。
+///
+/// 标准输出连续 [`INVALID_LINES_MAX`] 行不是合法消息就当插件坏了：记下乱输出、调 `stop` 结束它、关掉连接。
+pub struct LinePipe {
+    stdin: Mutex<Pin<Box<dyn AsyncWrite + Send>>>,
+    stdout: Mutex<LinesIn>,
     /// 连续读到的不合法行数（读到一条合法的就清零）。
     invalid: AtomicUsize,
-    /// 因为连续乱输出被结束的（宿主据此说明它为什么断了）。
+    /// 因为连续乱输出被结束的。
     garbled: AtomicBool,
+    /// 结束插件（乱输出时调）。
+    stop: Box<dyn Fn() + Send + Sync>,
 }
 
-impl StdioChild {
-    /// 启动子进程：设 `HHH_IM_PROTOCOL=1`、工作目录为给定临时目录；stderr 每行交给 `on_log`。
-    ///
-    /// # Errors
-    /// 进程起不来时返回 IO 错误。
-    pub fn spawn(
-        program: &str,
-        args: &[String],
-        cwd: &std::path::Path,
-        on_log: impl Fn(String) + Send + 'static,
-    ) -> std::io::Result<Arc<Self>> {
-        let mut child = plugin_command(program, args, cwd).spawn()?;
-        let stdin = child.stdin.take().expect("stdin piped");
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-
-        // stderr → 日志（每行截断在调用方做）。
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                on_log(line);
-            }
-        });
-
-        Ok(Arc::new(Self {
-            stdin: Mutex::new(stdin),
+impl LinePipe {
+    /// 接上插件的标准输入（写）与标准输出（读）；`stop` 在认出连续乱输出时调，用来结束插件。
+    pub fn new(
+        stdin: impl AsyncWrite + Send + 'static,
+        stdout: impl AsyncRead + Send + 'static,
+        stop: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let stdout: Pin<Box<dyn AsyncRead + Send>> = Box::pin(stdout);
+        Self {
+            stdin: Mutex::new(Box::pin(stdin)),
             stdout: Mutex::new(BufReader::new(stdout).lines()),
-            child: Mutex::new(child),
             invalid: AtomicUsize::new(0),
             garbled: AtomicBool::new(false),
-        }))
-    }
-
-    /// 把子进程借给 `f` 看一眼（起好后紧接着调，比如宿主要把它绑到自己的生命周期上）。
-    /// 管道已归这个传输，借出的 `Child` 只用来读进程句柄、编号。
-    pub async fn with_child<R>(&self, f: impl FnOnce(&tokio::process::Child) -> R) -> R {
-        f(&*self.child.lock().await)
+            stop: Box::new(stop),
+        }
     }
 
     /// 是不是因为连续乱输出被结束的。
@@ -293,24 +269,9 @@ impl StdioChild {
     fn note_invalid(&self) -> bool {
         self.invalid.fetch_add(1, Ordering::SeqCst) + 1 >= INVALID_LINES_MAX
     }
-
-    /// 结束子进程（关 stdin 后杀）。
-    pub async fn shutdown(&self) {
-        let mut child = self.child.lock().await;
-        let _ = child.kill().await;
-    }
-
-    /// 不等地叫子进程结束（同步，可在 `Drop` 里用）：宿主放下一个插件连接时调。读它输出的任务拿着这个句柄，
-    /// 光放下句柄等不到 `kill_on_drop`，插件会一直跑着（Windows 上它的程序文件也删不掉）。
-    /// 正有别人在 [`Self::shutdown`] 时什么也不做（那边会杀）。
-    pub fn kill_now(&self) {
-        if let Ok(mut child) = self.child.try_lock() {
-            let _ = child.start_kill();
-        }
-    }
 }
 
-impl ProviderTransport for StdioChild {
+impl ProviderTransport for LinePipe {
     fn send(
         &self,
         msg: RpcMessage,
@@ -348,7 +309,7 @@ impl ProviderTransport for StdioChild {
                                         "插件连续输出不合法的内容，结束它"
                                     );
                                     self.garbled.store(true, Ordering::SeqCst);
-                                    self.kill_now();
+                                    (self.stop)();
                                     return None;
                                 }
                                 continue;
@@ -363,6 +324,125 @@ impl ProviderTransport for StdioChild {
                 }
             }
         })
+    }
+}
+
+/// 起插件进程的命令：三路管道、设 `HHH_IM_PROTOCOL=1`、工作目录为给定临时目录。
+fn plugin_command(
+    program: &str,
+    args: &[String],
+    cwd: &std::path::Path,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env(crate::ENV_FLAG, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // 兜底：句柄真被丢弃时结束子进程。读输出的任务一直拿着句柄，平时靠宿主 `kill_now` / `shutdown` 结束它。
+        .kill_on_drop(true);
+    // Windows：按控制台程序编的插件（模板默认就是）被桌面宿主拉起时会弹出一个黑色控制台窗口；插件只经管道说话，
+    // 不要窗口（CREATE_NO_WINDOW）。
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+/// 按清单启动子进程、走它 stdin/stdout 的传输（protocol-v1 §3）。stderr 每行交给回调（并入宿主日志）。
+pub struct StdioChild {
+    pipe: LinePipe,
+    child: Arc<Mutex<tokio::process::Child>>,
+}
+
+impl StdioChild {
+    /// 启动子进程：设 `HHH_IM_PROTOCOL=1`、工作目录为给定临时目录；stderr 每行交给 `on_log`。
+    ///
+    /// # Errors
+    /// 进程起不来时返回 IO 错误。
+    pub fn spawn(
+        program: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        on_log: impl Fn(String) + Send + 'static,
+    ) -> std::io::Result<Arc<Self>> {
+        let mut child = plugin_command(program, args, cwd).spawn()?;
+        let stdin = child.stdin.take().expect("stdin piped");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+
+        // stderr → 日志（每行截断在调用方做）。
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                on_log(line);
+            }
+        });
+
+        let child = Arc::new(Mutex::new(child));
+        let stopping = child.clone();
+        Ok(Arc::new(Self {
+            pipe: LinePipe::new(stdin, stdout, move || start_kill(&stopping)),
+            child,
+        }))
+    }
+
+    /// 把子进程借给 `f` 看一眼（起好后紧接着调，比如宿主要把它绑到自己的生命周期上）。
+    /// 管道已归这个传输，借出的 `Child` 只用来读进程句柄、编号。
+    pub async fn with_child<R>(&self, f: impl FnOnce(&tokio::process::Child) -> R) -> R {
+        f(&*self.child.lock().await)
+    }
+
+    /// 是不是因为连续乱输出被结束的。
+    pub fn garbled(&self) -> bool {
+        self.pipe.garbled()
+    }
+
+    /// 结束子进程（关 stdin 后杀）。
+    pub async fn shutdown(&self) {
+        let mut child = self.child.lock().await;
+        let _ = child.kill().await;
+    }
+
+    /// 不等地叫子进程结束（同步，可在 `Drop` 里用）：宿主放下一个插件连接时调。读它输出的任务拿着这个句柄，
+    /// 光放下句柄等不到 `kill_on_drop`，插件会一直跑着（Windows 上它的程序文件也删不掉）。
+    /// 正有别人在 [`Self::shutdown`] 时什么也不做（那边会杀）。
+    pub fn kill_now(&self) {
+        start_kill(&self.child);
+    }
+}
+
+/// 不等地叫子进程结束；正有别人拿着它（在 `shutdown`）时什么也不做。
+fn start_kill(child: &Mutex<tokio::process::Child>) {
+    if let Ok(mut child) = child.try_lock() {
+        let _ = child.start_kill();
+    }
+}
+
+impl PluginProcess for StdioChild {
+    fn kill_now(&self) {
+        StdioChild::kill_now(self);
+    }
+
+    fn garbled(&self) -> bool {
+        StdioChild::garbled(self)
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(StdioChild::shutdown(self))
+    }
+}
+
+impl ProviderTransport for StdioChild {
+    fn send(
+        &self,
+        msg: RpcMessage,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        self.pipe.send(msg)
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = Option<RpcMessage>> + Send + '_>> {
+        self.pipe.recv()
     }
 }
 
@@ -507,6 +587,39 @@ mod tests {
             .expect("连续乱输出后连接应关掉");
         assert!(ended.is_none());
         assert!(child.garbled());
+    }
+
+    /// 不是子进程的插件（如 iPhone 上的 WASM 实例）同样经一对字节流收发；连续乱输出时调它给的结束办法、连接关掉。
+    #[tokio::test]
+    async fn a_line_pipe_over_plain_streams_speaks_and_stops_a_garbled_plugin() {
+        let (host_in, mut plugin_in) = tokio::io::duplex(4096);
+        let (mut plugin_out, host_out) = tokio::io::duplex(4096);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        let pipe = LinePipe::new(host_in, host_out, move || {
+            flag.store(true, Ordering::SeqCst)
+        });
+
+        pipe.send(RpcMessage::notification("ping", serde_json::json!({})))
+            .await
+            .unwrap();
+        let mut sent = vec![0u8; 256];
+        let read = tokio::io::AsyncReadExt::read(&mut plugin_in, &mut sent)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&sent[..read]).contains("\"ping\""));
+
+        plugin_out
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"status\",\"params\":{}}\nnot json\nstill not\n",
+            )
+            .await
+            .unwrap();
+        assert_eq!(pipe.recv().await.unwrap().method.as_deref(), Some("status"));
+        plugin_out.write_all(b"third bad line\n").await.unwrap();
+        assert!(pipe.recv().await.is_none(), "连续三行乱输出后关掉");
+        assert!(pipe.garbled());
+        assert!(stopped.load(Ordering::SeqCst), "调了结束办法");
     }
 
     #[tokio::test]

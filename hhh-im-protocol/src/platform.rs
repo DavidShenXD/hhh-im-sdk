@@ -510,6 +510,60 @@ pub struct PlatformDesc {
     /// 当前的重译规则，按顺序（声明了 `retranslate` 能力时有用）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retranslate_rules: Vec<RetranslateRule>,
+    /// 按顺序执行的已存消息修正规则；不依赖原始响应。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_repairs: Vec<String>,
+    /// 当前视野的旧消息是否需要重新读取的判定规则。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_rereads: Vec<String>,
+}
+
+impl PlatformDesc {
+    /// 校验旧消息维护声明，供宿主与插件自检使用同一组约束。
+    ///
+    /// # Errors
+    /// 规则名、预算或能力组合不合法时返回原因。
+    pub fn check_maintenance(&self, caps: &Capabilities) -> Result<(), &'static str> {
+        if caps.message_maintenance
+            && self
+                .retranslate_rules
+                .iter()
+                .any(|r| r.name.starts_with("repair:"))
+        {
+            return Err("重译规则占用了宿主的维护标记");
+        }
+        if !caps.message_maintenance
+            && (!self.content_repairs.is_empty() || !self.content_rereads.is_empty())
+        {
+            return Err("消息维护规则没有声明对应能力");
+        }
+        if !self.content_rereads.is_empty() && !caps.messages.get {
+            return Err("旧消息重读需要声明 messages.get");
+        }
+        for names in [&self.content_repairs, &self.content_rereads] {
+            let mut seen = std::collections::HashSet::new();
+            if names.len() > crate::budget::MAINTENANCE_RULES_MAX
+                || names.iter().any(|name| {
+                    name.is_empty()
+                        || name.len() > 128
+                        || !name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                        || !seen.insert(name)
+                })
+            {
+                return Err("消息维护规则名不合法或重复");
+            }
+        }
+        if self
+            .content_rereads
+            .iter()
+            .any(|name| self.retranslate_rules.iter().any(|r| &r.name == name))
+        {
+            return Err("重读与重译规则使用了同一个完成标记");
+        }
+        Ok(())
+    }
 }
 
 /// 一组能力开关（protocol-v1 §5.2）。没写出来的都算不支持。
@@ -546,6 +600,9 @@ pub struct Capabilities {
     /// 支持原始数据与重新翻译。
     #[serde(default)]
     pub retranslate: bool,
+    /// 支持对统一消息进行纯本地修正与重读判定。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub message_maintenance: bool,
     /// 会话（账号）能力。
     #[serde(default, skip_serializing_if = "SessionCaps::is_empty")]
     pub session: SessionCaps,
@@ -848,6 +905,52 @@ impl Capabilities {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn maintenance_declarations_are_opt_in_bounded_and_keep_old_rules_valid() {
+        use serde_json::json;
+        let mut platform: PlatformDesc = serde_json::from_value(json!({
+            "avatarShape": "circle", "history": "server",
+            "actions": {"reply": false, "thread": false, "react": false, "edit": {"own": false}},
+            "retranslateRules": [{"name": "repair:legacy"}]
+        }))
+        .unwrap();
+        let mut caps = Capabilities::default();
+        assert!(
+            platform.check_maintenance(&caps).is_ok(),
+            "旧插件不受新可选能力约束"
+        );
+        caps.message_maintenance = true;
+        assert!(platform.check_maintenance(&caps).is_err());
+        platform.retranslate_rules.clear();
+        for names in [
+            vec!["".into()],
+            vec!["bad:name".into()],
+            vec!["规则".into()],
+            vec!["x".repeat(129)],
+            vec!["same".into(), "same".into()],
+            (0..65).map(|n| format!("rule-{n}")).collect(),
+        ] {
+            platform.content_repairs = names;
+            assert!(platform.check_maintenance(&caps).is_err());
+        }
+        platform.content_repairs = vec!["case_v1.2-fix".into()];
+        assert!(platform.check_maintenance(&caps).is_ok());
+        caps.message_maintenance = false;
+        assert!(platform.check_maintenance(&caps).is_err());
+        caps.message_maintenance = true;
+        platform.content_rereads = vec!["read".into()];
+        assert!(
+            platform.check_maintenance(&caps).is_err(),
+            "重读需要 messages.get"
+        );
+        caps.messages.get = true;
+        assert!(platform.check_maintenance(&caps).is_ok());
+        platform.retranslate_rules = serde_json::from_value(json!([{"name": "read"}])).unwrap();
+        assert!(
+            platform.check_maintenance(&caps).is_err(),
+            "重读和重译不能共用完成标记"
+        );
+    }
 
     // 契约 provider-protocol v14：头像身份、猜图范围都可选；不写时读成空、写回不多出键，写了原样往返。
     #[test]
@@ -1020,6 +1123,8 @@ mod tests {
             user_adjustable: Vec::new(),
             edits_by_content: Vec::new(),
             retranslate_rules: Vec::new(),
+            content_repairs: Vec::new(),
+            content_rereads: Vec::new(),
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["avatarShape"], "rounded");
@@ -1093,6 +1198,13 @@ mod tests {
         use serde_json::json;
         let caps: Capabilities =
             serde_json::from_value(json!({ "conversations": { "list": true } })).unwrap();
+        assert!(!caps.message_maintenance);
+        assert!(
+            serde_json::to_value(&caps)
+                .unwrap()
+                .get("messageMaintenance")
+                .is_none()
+        );
         assert!(!caps.conversations.recent_activity && !caps.session.renew);
         let v = serde_json::to_value(&caps).unwrap();
         assert!(v.get("session").is_none(), "没声明续期时不写 session");

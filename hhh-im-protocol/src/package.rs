@@ -108,19 +108,18 @@ fn unpack_within<R: Read + Seek>(
             .by_index(index)
             .map_err(|error| PackageError(format!("安装包读不了：{error}")))?;
         // 原名也要看：zip 库会把开头的 `/` 去掉再给路径，绝对路径、反斜杠、盘符这种写法一律不收。
-        let raw = entry.name();
+        let Ok(raw) = entry.name() else {
+            return fail("安装包里有读不出的文件名，不能安装。");
+        };
         let raw_ok = !raw.starts_with('/') && !raw.contains('\\') && !raw.contains(':');
         let Some(path) = entry
             .enclosed_name()
             .filter(|path| raw_ok && safe_relative(path))
         else {
-            return fail(format!(
-                "安装包里有不安全的路径（{}），不能安装。",
-                entry.name()
-            ));
+            return fail(format!("安装包里有不安全的路径（{raw}），不能安装。"));
         };
         if entry.is_symlink() {
-            return fail(format!("安装包里有链接（{}），不能安装。", entry.name()));
+            return fail(format!("安装包里有链接（{raw}），不能安装。"));
         }
         if !entry.is_dir() {
             files += 1;
@@ -211,7 +210,8 @@ pub struct Packed {
 /// 把插件文件夹打成给 `target` 的安装包，放进 `out`（没有就建）：清单写上目标、其余文件原样；跳过以点开头的文件与
 /// 文件夹、`out` 本身和别的 `.hhhim`。清单要合规（编号、版本号、发布字段，且支持这个目标的系统）。
 /// 打 Windows 包时清单的 `command` 没写扩展名、文件夹里有 `<command>.exe`，包里的清单写成带 `.exe` 的：同一份清单能打
-/// 各系统的包（宿主按清单路径直接启动程序，Windows 上要带扩展名）。
+/// 各系统的包（宿主按清单路径直接启动程序，Windows 上要带扩展名）。打 iPhone / iPad 的 WASM 包时同理找 `<command>.wasm`，
+/// 而且程序必须是 WASM 文件（契约 provider-protocol v18）。
 pub fn pack(dir: &Path, target: Target, out: &Path) -> Result<Packed, PackageError> {
     let manifest_path = dir.join(crate::MANIFEST_FILE);
     let text = std::fs::read_to_string(&manifest_path).map_err(|error| {
@@ -239,6 +239,19 @@ pub fn pack(dir: &Path, target: Target, out: &Path) -> Result<Packed, PackageErr
         && dir.join(&windows_program).is_file()
     {
         manifest.command = windows_program;
+    }
+    if target.is_wasm() {
+        let wasm_program = format!("{}.wasm", manifest.command);
+        if !manifest.command.ends_with(".wasm") && dir.join(&wasm_program).is_file() {
+            manifest.command = wasm_program;
+        }
+        if !wasm_file(&dir.join(&manifest.command)) {
+            return fail(format!(
+                "打 {} 的包要放 WASM 程序：{} 不是 WASM 文件。",
+                target.label(),
+                manifest.command
+            ));
+        }
     }
     manifest.release_fields_ok().map_err(PackageError)?;
     let manifest_json = serde_json::to_string_pretty(&manifest)
@@ -318,6 +331,15 @@ pub fn pack(dir: &Path, target: Target, out: &Path) -> Result<Packed, PackageErr
         size,
         manifest,
     })
+}
+
+/// 文件开头是不是 WASM 的魔数（`\0asm`）。
+fn wasm_file(path: &Path) -> bool {
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok()
+        && &magic == b"\0asm"
 }
 
 fn unix_executable(path: &Path) -> bool {
@@ -431,6 +453,30 @@ mod tests {
         assert_eq!(packed.manifest.command, "bin/demo.exe");
         let linux = pack(&dir, Target::LinuxX64, &root.0.join("dist")).unwrap();
         assert_eq!(linux.manifest.command, "bin/demo", "别的系统不改");
+    }
+
+    // iPhone / iPad 的包：命令指向 `<command>.wasm`（文件夹里有它时），程序必须是 WASM 文件；清单的 os 要写 ios。
+    #[test]
+    fn a_wasm_package_points_the_command_at_the_wasm_program() {
+        let root = temp("wasm");
+        let dir = root.0.join("plugin");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let manifest = MANIFEST.replace(r#"["windows","linux"]"#, r#"["windows","linux","ios"]"#);
+        std::fs::write(dir.join(crate::MANIFEST_FILE), &manifest).unwrap();
+        std::fs::write(dir.join("bin/demo.wasm"), b"\0asm\x0d\0\x01\0").unwrap();
+        let packed = pack(&dir, Target::Wasm32Wasip2, &root.0.join("dist")).unwrap();
+        assert_eq!(packed.file, "demo-im-0.2.0-wasm32-wasip2.hhhim");
+        assert_eq!(packed.manifest.command, "bin/demo.wasm");
+        assert_eq!(packed.manifest.target.as_deref(), Some("wasm32-wasip2"));
+        assert!(packed.manifest.release_fields_ok().is_ok());
+
+        std::fs::write(dir.join("bin/demo.wasm"), b"not wasm").unwrap();
+        let error = pack(&dir, Target::Wasm32Wasip2, &root.0.join("dist")).unwrap_err();
+        assert!(error.0.contains("WASM"), "{}", error.0);
+
+        std::fs::write(dir.join(crate::MANIFEST_FILE), MANIFEST).unwrap();
+        let error = pack(&dir, Target::Wasm32Wasip2, &root.0.join("dist")).unwrap_err();
+        assert!(error.0.contains("ios"), "清单没写 ios 不打：{}", error.0);
     }
 
     #[test]
