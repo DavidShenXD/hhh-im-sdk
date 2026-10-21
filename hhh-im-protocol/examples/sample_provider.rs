@@ -20,8 +20,8 @@
 //!   “完成”存凭据，`login/finished` 带成功页的标题与一段话；`host-fail`——`login/failed`（能重试，带失败页标题“没开通成”与
 //!   重试按钮“再试一次”）。这两个文件留着不删（测试来回切）。
 //! - **插件操作**（除 `--plain` 外都声明）：管理菜单里“我的设备”“我的链接”“加个朋友”“关于示例”，群的会话菜单里“群成员”
-//!   “邀请成员”“退出群”（`conversationKinds: ["group"]`，私聊没有会话菜单）。`actions/start` 回 `{flowId}`，第一步在回复之后推；
-//!   新的 `actions/start` 或 `login/start` 取消还没结束的旧流程，`action/cancel` 静静结束。各操作：
+//!   “邀请成员”“退出群”（`conversationKinds: ["group"]`），再加不写种类、私聊与群都有的“删除会话”（v19）。`actions/start` 回
+//!   `{flowId}`，第一步在回复之后推；新的 `actions/start` 或 `login/start` 取消还没结束的旧流程，`action/cancel` 静静结束。各操作：
 //!   - 我的设备：设备列表（本机标“本机”、没有按钮，别的设备行尾“移除”，危险色），下面“重新生成恢复密钥”。移除 → 确认
 //!     “移除「…」？”（危险）→ 移除后回到列表、带一句提示；重新生成 → 确认 → 出示新的 12 个词（不能跳过）→ 回到列表。
 //!   - 我的链接：出示好友链接（一行等宽、能复制），下面“换一条链接” → 确认 → 出示新链接、带一句提示。
@@ -32,6 +32,8 @@
 //!   - 邀请成员：勾选不在群里的好友（至少 1 个，“邀请”），下面“改用群邀请链接” → 出示群链接，下面“改回勾选好友”；勾好确认
 //!     → 成功页“已邀请”。
 //!   - 退出群：确认（危险，“退出群”）→ 成功页；只在内存里记下，重启插件后回到群里。
+//!   - 删除会话：确认“删除「…」？”（不危险，“删除”）→ `action/finished { removeFromList: true }`，不给标题与说明（对话框直接
+//!     关掉、会话离开宿主的列表）；平台上什么都不动，这个会话再来新消息时宿主的会话发现把它带回来。
 //!   - 各步的确认（移除、换链接、核对是谁、移出）点“取消”回到上一步（`cancelChoice: back`）。
 //! - **请你处理的事**：`approve` 开关让新设备「示例平板」来请求批准：`session/notice` 里多一条带“查看”（`action.id` 是
 //!   `approve:1`，不在 `initialize.actions` 里）与 `prompt` 的提醒，处理完之前每次给全提醒时都带着它。`actions/start
@@ -41,7 +43,7 @@
 //!
 //! 工作目录（宿主给的临时目录）里出现这些文件时照做：`expire` 说登录失效；`notice` 报一条要重新登录的问题、`notice-clear`
 //! 清掉它；`approve` 来一条等批准的新设备请求、`approve-clear` 撤掉它（批准框开着就以“请求已作废”结束）；`new-message` 在
-//! 没关注的“示例公告”里来一条新消息（会话发现用）；`edit` 改掉第一条的文字（按内容认编辑用）——以上做完删掉文件。
+//! 没关注的“示例公告”里来一条新消息（会话发现用；文件里写了会话编号如 `c-direct` 就来在那个会话里）；`edit` 改掉第一条的文字（按内容认编辑用）——以上做完删掉文件。
 //! `deny-reactions` 在时读表情一律回没有权限；`rule-v2` 在时多声明一条重译规则 `sample-v2`（下次打开生效）；`host-key`、
 //! `host-fail` 见上文（用宿主账号登录时看，不删）。
 //!
@@ -124,6 +126,8 @@ const APPROVE_WORDS: &str = "松果 飞机 河流 积木";
 const APPROVE_TRIES: u32 = 5;
 /// 等批准的提醒上“查看”对应的操作编号（不在 `initialize.actions` 里）。
 const APPROVE_ACTION: &str = "approve:1";
+/// 会话菜单里“删除会话”的操作编号（v19，私聊与群都有）。
+const DELETE_ACTION: &str = "delete-conversation";
 /// 恢复密钥从这些词里挑 12 个（每次重新生成换一组）。
 const KEY_WORDS: [&str; 24] = [
     "月光", "森林", "灯塔", "茶杯", "风筝", "雪山", "铅笔", "海豚", "草莓", "钟表", "云朵", "石桥",
@@ -216,6 +220,8 @@ enum Stage {
     InviteLink(String),
     /// 退出群：确认。
     Leave(String),
+    /// 删除会话：确认（v19）。
+    Delete(String),
     /// 批准新设备：填 4 个词。
     Approve,
 }
@@ -606,7 +612,8 @@ fn initialize(state: &State) -> Value {
         "settings": settings,
         "loginMethods": login_methods
     });
-    // 插件操作（v13）：账号级的进管理菜单，会话级的只给群（私聊没有会话菜单）。`--plain` 不声明。
+    // 插件操作（v13）：账号级的进管理菜单，会话级的进会话菜单——群成员、邀请、退出只给群，删除会话（v19）不写种类、
+    // 私聊与群都有。`--plain` 不声明。
     if !state.plain {
         result["actions"] = json!([
             { "id": "devices", "label": "我的设备", "scope": "account" },
@@ -615,7 +622,8 @@ fn initialize(state: &State) -> Value {
             { "id": "about", "label": "关于示例", "scope": "account" },
             { "id": "members", "label": "群成员", "scope": "conversation", "conversationKinds": ["group"] },
             { "id": "invite", "label": "邀请成员", "scope": "conversation", "conversationKinds": ["group"] },
-            { "id": "leave", "label": "退出群", "scope": "conversation", "conversationKinds": ["group"] }
+            { "id": "leave", "label": "退出群", "scope": "conversation", "conversationKinds": ["group"] },
+            { "id": DELETE_ACTION, "label": "删除会话", "scope": "conversation" }
         ]);
     }
     result
@@ -1002,6 +1010,14 @@ fn start_action(params: &Value, state: &Arc<Mutex<State>>) -> Result<Value, RpcE
         ),
         "leave" => Next::Failed(json!({ "title": "不在这个群里",
             "message": format!("你已经退出「{}」了。", group_name(&conversation)), "retryable": false })),
+        DELETE_ACTION if self::conversation(&conversation).is_none() => {
+            eprintln!("sample_provider: {action} 给的会话 {conversation} 不是示例 IM 的会话");
+            return Err(error("notFound", "示例 IM 里没有这个会话。"));
+        }
+        DELETE_ACTION => Next::Step(
+            Stage::Delete(conversation.clone()),
+            delete_step(&conversation),
+        ),
         APPROVE_ACTION => match st.approve_wrong {
             Some(wrong) => Next::Step(Stage::Approve, approve_step(wrong)),
             None => Next::Failed(json!({ "title": "请求已失效",
@@ -1419,6 +1435,16 @@ fn advance(st: &mut State, stage: Stage, input: Input<'_>) -> Next {
             Next::Finished(json!({ "title": format!("已退出「{}」", group_name(&c)),
                 "message": "演示插件只在内存里记下这件事，重启插件后你会回到群里。" }))
         }
+        // 删除会话（v19）：平台上什么都不动，只请宿主把它从列表里拿掉；不给标题与说明，对话框直接关掉。
+        (
+            Stage::Delete(c),
+            Choose {
+                choice: "confirm", ..
+            },
+        ) => {
+            eprintln!("sample_provider: 删除会话 {c}，请宿主从列表里拿掉");
+            Next::Finished(json!({ "removeFromList": true }))
+        }
         // 批准新设备。
         (Stage::Approve, Submit(values)) => {
             let typed = values["words"]
@@ -1663,6 +1689,15 @@ fn invite_step(st: &State, conversation_id: &str, warn: Option<&str>) -> Value {
 fn leave_step(conversation_id: &str) -> Value {
     json!({ "kind": "confirm", "caption": format!("退出「{}」？", group_name(conversation_id)), "danger": true,
         "confirmLabel": "退出群", "text": "退出后读不到群里之后的新消息；以前的消息还在这台设备上。要回来需要群里的人重新邀请。" })
+}
+
+/// 删除会话：可撤销的确认（不用危险色）。
+fn delete_step(conversation_id: &str) -> Value {
+    let name = conversation(conversation_id)
+        .and_then(|c| c["name"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    json!({ "kind": "confirm", "caption": format!("删除「{name}」？"), "confirmLabel": "删除",
+        "text": "只从你的列表里拿掉，聊天记录还在；有新消息时会再出现。" })
 }
 
 /// 批准新设备：填 4 个词（“拒绝 / 批准”，“拒绝”是一个选择）；输错过就带“还能试几次”的警告。
@@ -2127,19 +2162,29 @@ fn watch_switches(state: Arc<Mutex<State>>, out: Out) {
                 }
                 notify(&out, "session/notice", params);
             }
-            if std::fs::remove_file("new-message").is_ok() {
+            // 文件里写了示例 IM 的会话编号（如 `c-direct`）就来在那个会话里（删除会话后看它回到列表，v19），否则在示例公告。
+            if let Ok(named) = std::fs::read_to_string("new-message")
+                && std::fs::remove_file("new-message").is_ok()
+            {
+                let named = named.trim();
+                let (chat, sender, text) = match conversation(named) {
+                    Some(c) if named == "c-direct" => (
+                        named,
+                        "u-amy",
+                        format!("{}：在吗？", c["name"].as_str().unwrap_or("")),
+                    ),
+                    Some(c) => (
+                        named,
+                        "u-bo",
+                        format!("{}：有一条新消息", c["name"].as_str().unwrap_or("")),
+                    ),
+                    None => ("c-news", "u-bo", "示例公告：今天下午三点开会".to_owned()),
+                };
                 let mut state = state.lock().unwrap();
                 let n = state.messages.len();
-                let m = message(
-                    &format!("m-new-{n}"),
-                    "c-news",
-                    "u-bo",
-                    now_ms(),
-                    "示例公告：今天下午三点开会",
-                    false,
-                );
+                let m = message(&format!("m-new-{n}"), chat, sender, now_ms(), &text, false);
                 state.messages.push(m);
-                eprintln!("sample_provider: 开关 new-message，示例公告来了一条新消息");
+                eprintln!("sample_provider: 开关 new-message，{chat} 来了一条新消息");
             }
             if std::fs::remove_file("edit").is_ok() {
                 let mut state = state.lock().unwrap();

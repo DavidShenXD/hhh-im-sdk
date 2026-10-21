@@ -348,6 +348,9 @@ pub struct ActionDecl {
     pub label: String,
     /// 放在哪个菜单。
     pub scope: ActionScope,
+    /// 在会话列表的“＋”中显示；只适用于账号级操作，未声明时为假。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shortcut: bool,
     /// 会话级操作只在这几种会话上有；不写就是每种会话都有。账号级操作不看它。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conversation_kinds: Vec<ConversationKind>,
@@ -1051,7 +1054,7 @@ pub struct StepChooseParams {
 /// ```
 /// use hhh_im_protocol::method::{action_problem, ActionDecl, ActionScope};
 /// let decl = |id: &str, label: &str| ActionDecl {
-///     id: id.into(), label: label.into(), scope: ActionScope::Account, conversation_kinds: vec![] };
+///     id: id.into(), label: label.into(), scope: ActionScope::Account, shortcut: false, conversation_kinds: vec![] };
 /// assert_eq!(action_problem(&decl("devices", "我的电脑")), None);
 /// assert!(action_problem(&decl("", "我的电脑")).is_some());
 /// assert!(action_problem(&decl("devices", "  ")).is_some());
@@ -1061,6 +1064,8 @@ pub fn action_problem(decl: &ActionDecl) -> Option<&'static str> {
     use crate::budget::ACTION_LABEL_MAX_CHARS;
     if decl.scope == ActionScope::Unknown {
         Some("放在哪个菜单认不出")
+    } else if decl.shortcut && decl.scope != ActionScope::Account {
+        Some("只有账号级操作能放在会话列表的加号中")
     } else if !crate::platform::Manifest::id_ok(&format!("a{}", decl.id)) || decl.id.is_empty() {
         Some("编号是空的或写法不对")
     } else if decl.label.trim().is_empty() || decl.label.chars().count() > ACTION_LABEL_MAX_CHARS {
@@ -1357,6 +1362,13 @@ pub struct ActionFinishedParams {
     /// 成功页的一段话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// 做完后把这个会话从列表里拿掉（契约 provider-protocol v19）：只对会话级操作（`actions/start` 带了
+    /// `conversationId`）有效，宿主当作取消关注——不删记录、不动平台，有新消息时会话照样回来。账号级操作带了宿主不理会。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remove_from_list: bool,
+    /// 完成后打开这个会话；宿主先向当前账号核对资料，再加入列表。不与移出列表同时使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_conversation_id: Option<String>,
 }
 
 /// `action/failed` 通知参数（插件→宿主）。
@@ -2330,8 +2342,20 @@ mod tests {
         let action_failed: ActionFailedParams = serde_json::from_value(failed.clone()).unwrap();
         assert_eq!(serde_json::to_value(&action_failed).unwrap(), failed);
         let done: ActionFinishedParams = serde_json::from_value(json!({ "flowId": "f" })).unwrap();
+        assert!(!done.remove_from_list, "旧形状照读");
         assert_eq!(
             serde_json::to_value(&done).unwrap(),
+            json!({ "flowId": "f" })
+        );
+        // v19：做完后让会话离开列表；`false` 写回不多出键。
+        let removed = json!({ "flowId": "f", "removeFromList": true });
+        let parsed: ActionFinishedParams = serde_json::from_value(removed.clone()).unwrap();
+        assert!(parsed.remove_from_list);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), removed);
+        let kept: ActionFinishedParams =
+            serde_json::from_value(json!({ "flowId": "f", "removeFromList": false })).unwrap();
+        assert_eq!(
+            serde_json::to_value(&kept).unwrap(),
             json!({ "flowId": "f" })
         );
 

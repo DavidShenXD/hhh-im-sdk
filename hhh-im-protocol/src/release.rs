@@ -5,6 +5,8 @@
 //! - 安装包 `<插件编号>-<版本>-<目标>.hhhim` 就是 zip，最上层是清单 [`crate::MANIFEST_FILE`]，一个包只给一个目标；
 //! - 发版本 = 在仓库打标签 `v<版本>`、建正式 Release，附上各目标的包与版本索引 [`RELEASE_INDEX_FILE`]；
 //! - 宿主只读版本索引：编号、版本、最低宿主版本、更新说明（Markdown）、每个目标的包名、大小与 sha256。
+//! - GitLab 另把最新一版的索引原样再放一份到通用包仓库的固定位置（[`LATEST_INDEX_VERSION`]）：只能读包仓库的令牌
+//!   （分享码里的部署令牌）查不了 Release，靠它找到最新版本（契约 provider-protocol v23 §6.1）。
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +14,18 @@ use serde::{Deserialize, Serialize};
 pub const PACKAGE_EXTENSION: &str = "hhhim";
 /// 每个版本附带的版本索引文件名。
 pub const RELEASE_INDEX_FILE: &str = "hhhim-release.json";
+/// GitLab 通用包仓库里放“最新版本索引”的版本名：最新一版的 [`RELEASE_INDEX_FILE`] 原样再放一份到
+/// `packages/generic/<插件编号>/latest/hhhim-release.json`，每次发布覆盖同一个文件名（站点读同名文件给最新的一份）。
+/// 字节与版本目录里的那份相同，官方签名照旧核对版本目录里的 [`RELEASE_SIGNATURE_FILE`]。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::release::{LATEST_INDEX_VERSION, RELEASE_INDEX_FILE};
+/// let path = format!("packages/generic/demo-im/{LATEST_INDEX_VERSION}/{RELEASE_INDEX_FILE}");
+/// assert_eq!(path, "packages/generic/demo-im/latest/hhhim-release.json");
+/// ```
+pub const LATEST_INDEX_VERSION: &str = "latest";
 /// 官方插件的版本索引签名（ed25519，索引原文的签名）文件名。
 pub const RELEASE_SIGNATURE_FILE: &str = "hhhim-release.json.sig";
 /// 版本索引格式的版本。

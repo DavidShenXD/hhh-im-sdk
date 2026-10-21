@@ -3,7 +3,7 @@
 //!
 //! 用法：
 //! ```text
-//! hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--sign-key <私钥文件>] [--publish]
+//! hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--sign-key <私钥文件>] [--publish [--latest-only]]
 //! hhh-im-pack keygen <放钥匙的文件夹>
 //! ```
 //! - `--target`：`windows-x64`、`macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64`，iPhone / iPad 用 `wasm32-wasip2`；
@@ -15,6 +15,9 @@
 //! - `--publish`：打好后发到清单 `source` 写的 GitHub / GitLab 仓库（见 [`publish`]）：标签默认 `v<清单版本>`，新版本要比
 //!   仓库里最新的正式版本大，仓库里同一版本已有的索引先合进来；令牌只从环境变量读（`HHH_IM_PUBLISH_TOKEN`，或
 //!   `GITHUB_TOKEN` / `GITLAB_TOKEN`）。
+//!   GitLab 发布时另把索引原样放到通用包仓库的 `<插件编号>/latest/`（契约 v23 §6.1）。
+//! - `--latest-only`（配合 `--publish`）：不打包、不传包，只给仓库里已发布的清单版本补上 `latest/` 那份索引；用旧版打包工具
+//!   发布过的 GitLab 插件，第一次分享前补一次（版本不用变）。
 //! - `--sign-key`：用这个私钥给写好的版本索引签名，写出 `hhhim-release.json.sig`，发布时一起上传（官方插件要，契约 v14 §2.5）。
 //! - `keygen`：生成一对签名钥匙（见 [`sign`]），已有同名文件时不覆盖。
 
@@ -41,10 +44,11 @@ struct Args {
     after: Option<String>,
     sign_key: Option<PathBuf>,
     publish: bool,
+    latest_only: bool,
 }
 
 fn usage() -> String {
-    "用法：hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--sign-key <私钥文件>] [--publish]\n      hhh-im-pack keygen <放钥匙的文件夹>".into()
+    "用法：hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--sign-key <私钥文件>] [--publish [--latest-only]]\n      hhh-im-pack keygen <放钥匙的文件夹>".into()
 }
 
 fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -56,6 +60,7 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut after = None;
     let mut sign_key = None;
     let mut publish = false;
+    let mut latest_only = false;
     let mut raw = raw.peekable();
     while let Some(arg) = raw.next() {
         let mut value = |name: &str| {
@@ -73,6 +78,7 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             "--after" => after = Some(value("--after")?),
             "--sign-key" => sign_key = Some(PathBuf::from(value("--sign-key")?)),
             "--publish" => publish = true,
+            "--latest-only" => latest_only = true,
             "-h" | "--help" => return Err(usage()),
             other if other.starts_with("--") => {
                 return Err(format!("不认识的参数 {other}。\n{}", usage()));
@@ -85,6 +91,12 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     let dir = dir.ok_or_else(usage)?;
+    if latest_only && !publish {
+        return Err(format!(
+            "--latest-only 要和 --publish 一起用（补的是仓库里的索引）。\n{}",
+            usage()
+        ));
+    }
     let target = match target {
         Some(target) => target,
         None => Target::host().ok_or("认不出这台电脑的目标，请用 --target 指定。")?,
@@ -99,7 +111,21 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         after,
         sign_key,
         publish,
+        latest_only,
     })
+}
+
+/// `--publish --latest-only`：读清单的编号、版本与来源，给仓库里已发布的这个版本补上“最新版本索引”，不打包。
+fn latest_only(args: &Args) -> Result<String, String> {
+    let path = args.dir.join(hhh_im_protocol::MANIFEST_FILE);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("读不到清单 {}：{error}", path.display()))?;
+    let manifest: hhh_im_protocol::Manifest =
+        serde_json::from_str(&text).map_err(|error| format!("清单格式不对：{error}"))?;
+    let version = Version::parse(&manifest.version).ok_or("清单版本号不是 主.次.修订。")?;
+    let tag = args.tag.clone().unwrap_or_else(|| format!("v{version}"));
+    let publisher = publish::Publish::prepare(manifest.source.as_ref(), &tag, version)?;
+    publisher.publish_latest_only(&manifest.id, &args.out)
 }
 
 /// 标志文件转成 data URL（版本索引内嵌，从仓库安装时预览用）；太大或类型不认就不放。
@@ -140,6 +166,9 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 fn run(args: Args) -> Result<String, String> {
+    if args.latest_only {
+        return latest_only(&args);
+    }
     // 私钥先读：读不了就不打包、不发布（别发出一个没签名的官方版本）。
     let signing = args.sign_key.as_deref().map(sign::load).transpose()?;
     let packed = package::pack(&args.dir, args.target, &args.out).map_err(|error| error.0)?;
@@ -477,6 +506,20 @@ mod tests {
         assert!(
             parse_args(["x".into(), "--target".into(), "windows-arm64".into()].into_iter())
                 .is_err()
+        );
+    }
+
+    // 只补最新版本索引补的是仓库里的那份：不和 --publish 一起用时说清，不打包。
+    #[test]
+    fn latest_only_needs_publish() {
+        let error = parse_args(["x".into(), "--latest-only".into()].into_iter())
+            .err()
+            .expect("不带 --publish 要拒绝");
+        assert!(error.contains("--publish"), "{error}");
+        assert!(
+            parse_args(["x".into(), "--publish".into(), "--latest-only".into()].into_iter())
+                .unwrap()
+                .latest_only
         );
     }
 

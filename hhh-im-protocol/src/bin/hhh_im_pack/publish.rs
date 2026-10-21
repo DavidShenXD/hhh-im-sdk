@@ -3,6 +3,8 @@
 //! - GitHub：仓库的标签 `v<版本>` 上建（或找到）正式 Release，包与 `hhhim-release.json` 作为附件上传（同名的先删再传）。
 //! - GitLab：包与索引放进项目的通用包仓库 `packages/generic/<插件编号>/<版本>/<文件名>`，Release 上挂指向它们的链接
 //!   （附件上传区的文件令牌下载不了，契约 §4.3 第 4 条）。标签要先推到仓库里。
+//! - GitLab 在 Release 建好之后，把这次的索引原样再放一份到 `packages/generic/<插件编号>/latest/`（契约 v23 §6.1）：
+//!   只能读包仓库的令牌靠它找到最新版本。`--latest-only` 只做这一步，给已发布的版本补上（不打包、不传包）。
 //! - 几台电脑各打各的目标时，发布前先读回仓库里同一版本的索引、合进这次的包，索引里就有全部目标。
 //! - 新版本必须比仓库里最新的正式版本大（同一版本补传别的目标除外）。
 //!
@@ -14,7 +16,9 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use hhh_im_protocol::release::{RELEASE_INDEX_FILE, ReleaseIndex, Source, Version};
+use hhh_im_protocol::release::{
+    LATEST_INDEX_VERSION, RELEASE_INDEX_FILE, ReleaseIndex, Source, Version,
+};
 
 /// 令牌的环境变量（先看通用的，再看各站点习惯的）。
 const TOKEN_ENV: &str = "HHH_IM_PUBLISH_TOKEN";
@@ -275,27 +279,104 @@ impl Publish {
                     return Err(reply.failure("读已有的版本索引"));
                 }
             }
-            Source::Gitlab { host, project } => {
-                let url = format!(
-                    "{}/api/v4/projects/{}/packages/generic/{id}/{}/{RELEASE_INDEX_FILE}",
-                    self.ends.gitlab(host),
-                    encode(project),
-                    self.version
-                );
-                let reply = self.curl("GET", &url, Body::None, &[])?;
-                if reply.status == 404 {
-                    return Ok(None);
-                }
-                if !reply.ok() {
-                    return Err(reply.failure("读已有的版本索引"));
-                }
-                reply.body
-            }
+            Source::Gitlab { host, project } => match self.gitlab_index_raw(host, project, id)? {
+                Some(raw) => raw,
+                None => return Ok(None),
+            },
             Source::Url { .. } => return Ok(None),
         };
         let index: ReleaseIndex = serde_json::from_slice(&raw)
             .map_err(|_| "仓库里已有的版本索引格式不对。".to_owned())?;
         Ok(Some(index).filter(|index| index.id == id && index.version == self.version.to_string()))
+    }
+
+    /// GitLab 通用包仓库里这个版本的索引原文（没有为空）。补“最新版本索引”要原样复制这份字节，官方签名才对得上。
+    fn gitlab_index_raw(
+        &self,
+        host: &str,
+        project: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let url = format!(
+            "{}/api/v4/projects/{}/packages/generic/{id}/{}/{RELEASE_INDEX_FILE}",
+            self.ends.gitlab(host),
+            encode(project),
+            self.version
+        );
+        let reply = self.curl("GET", &url, Body::None, &[])?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        if !reply.ok() {
+            return Err(reply.failure("读已有的版本索引"));
+        }
+        Ok(Some(reply.body))
+    }
+
+    /// 把一份索引放到 GitLab 通用包仓库的固定位置 `packages/generic/<编号>/latest/`（契约 v23 §6.1），覆盖同一个文件名。
+    /// 项目设了“不允许同名重传”时站点拒收：说清怎么改，别让人以为是令牌的问题。
+    fn put_latest(&self, api: &str, id: &str, index: &Path) -> Result<(), String> {
+        let url =
+            format!("{api}/packages/generic/{id}/{LATEST_INDEX_VERSION}/{RELEASE_INDEX_FILE}");
+        let reply = self.curl("PUT", &url, Body::File(index), &[])?;
+        if reply.ok() {
+            println!("已更新最新版本索引 {id}/{LATEST_INDEX_VERSION}/{RELEASE_INDEX_FILE}");
+            return Ok(());
+        }
+        if String::from_utf8_lossy(&reply.body)
+            .to_ascii_lowercase()
+            .contains("duplicate")
+        {
+            return Err(format!(
+                "这个 GitLab 项目不允许同名重传，最新版本索引放不上去（{}）：请在项目的 设置 → 包与仓库 里允许 generic 包重复，或请管理员打开。",
+                reply.status
+            ));
+        }
+        Err(reply.failure("上传最新版本索引 "))
+    }
+
+    /// `--latest-only`：给仓库里已经发布的这个版本补上“最新版本索引”（不打包、不传包），用旧工具发布过的插件第一次分享前用。
+    /// 只有 GitLab 要补：GitHub 照旧读最新 Release。这个版本的索引还不在仓库里时说清，先正常发布。
+    pub(crate) fn publish_latest_only(&self, id: &str, scratch: &Path) -> Result<String, String> {
+        let Source::Gitlab { host, project } = &self.source else {
+            return Err(
+                "只有 GitLab 来源要补最新版本索引；GitHub 照旧读最新 Release，不用补。".into(),
+            );
+        };
+        let raw = self.gitlab_index_raw(host, project, id)?.ok_or_else(|| {
+            format!(
+                "仓库里还没有 {} 的版本索引，先用 --publish 正常发布这个版本。",
+                self.version
+            )
+        })?;
+        let index: ReleaseIndex = serde_json::from_slice(&raw)
+            .map_err(|_| "仓库里已有的版本索引格式不对。".to_owned())?;
+        if index.id != id || index.version != self.version.to_string() {
+            return Err(format!(
+                "仓库里的版本索引写的是 {} {}，和清单的 {id} {} 对不上。",
+                index.id, index.version, self.version
+            ));
+        }
+        // curl 上传要一个文件：原文先写进输出文件夹里的临时文件，传完就删。
+        std::fs::create_dir_all(scratch)
+            .map_err(|error| format!("输出文件夹 {} 建不了：{error}", scratch.display()))?;
+        let temp = scratch.join(format!(".{RELEASE_INDEX_FILE}.latest"));
+        std::fs::write(&temp, &raw)
+            .map_err(|error| format!("临时文件 {} 写不进：{error}", temp.display()))?;
+        let api = format!(
+            "{}/api/v4/projects/{}",
+            self.ends.gitlab(host),
+            encode(project)
+        );
+        let result = self.put_latest(&api, id, &temp);
+        let _ = std::fs::remove_file(&temp);
+        result.map(|()| {
+            format!(
+                "已给 {id} {} 补上最新版本索引（{}/{project}）",
+                self.version,
+                host.trim_end_matches('/')
+            )
+        })
     }
 
     /// 仓库里最新的正式版本（没有为空）：新版本要比它大（同一版本补传别的目标除外）。
@@ -475,12 +556,14 @@ impl Publish {
             if !created.ok() {
                 return Err(created.failure("建 Release"));
             }
-            return Ok(created
+            let page = created
                 .json()?
                 .pointer("/_links/self")
                 .and_then(|url| url.as_str())
                 .unwrap_or_default()
-                .to_owned());
+                .to_owned();
+            self.put_latest_of(&api, id, files)?;
+            return Ok(page);
         }
         if !reply.ok() {
             return Err(reply.failure("读 Release"));
@@ -508,11 +591,22 @@ impl Publish {
                 return Err(added.failure(&format!("挂链接 {name} ")));
             }
         }
+        self.put_latest_of(&api, id, files)?;
         Ok(release
             .pointer("/_links/self")
             .and_then(|url| url.as_str())
             .unwrap_or_default()
             .to_owned())
+    }
+
+    /// Release 建好（或补上链接）之后放“最新版本索引”：外面读到的索引指向的包都已经传好。这次没传索引时不放。
+    fn put_latest_of(&self, api: &str, id: &str, files: &[&Path]) -> Result<(), String> {
+        match files.iter().find(|file| {
+            file.file_name().and_then(|name| name.to_str()) == Some(RELEASE_INDEX_FILE)
+        }) {
+            Some(index) => self.put_latest(api, id, index),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn version(&self) -> Version {
@@ -701,6 +795,17 @@ mod tests {
             .and(body_string_contains("https://git.example.com/api/v4/projects/team%2Fwechat/packages/generic/demo-im/0.4.0/hhhim-release.json"))
             .respond_with(ResponseTemplate::new(201).set_body_string(r#"{"_links":{"self":"https://git.example.com/team/wechat/-/releases/v0.4.0"}}"#))
             .expect(1).mount(&server).await;
+        // 最新版本索引（契约 v23 §6.1）：同一份索引再放到 latest/。
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "{api}/packages/generic/demo-im/latest/hhhim-release.json"
+            )))
+            .and(header("private-token", "tok_secret"))
+            .and(body_string_contains("{}"))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
         let dir = tempfile::tempdir().unwrap();
         let (package, index) = files(dir.path());
         let publish = publisher(
@@ -717,6 +822,212 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(page.ends_with("/-/releases/v0.4.0"));
+        // 最新版本索引在 Release 建好之后才放：外面读到它时，它指向的包与 Release 都已经在。
+        let requests = server.received_requests().await.unwrap();
+        let position = |method: &str, tail: &str| {
+            requests
+                .iter()
+                .position(|r| r.method.as_str() == method && r.url.path().ends_with(tail))
+                .unwrap()
+        };
+        assert!(
+            position("POST", "/releases") < position("PUT", "/latest/hhhim-release.json"),
+            "先建 Release，再放最新版本索引"
+        );
+    }
+
+    // 同一版本补传别的目标：Release 已在、补上链接后照样更新最新版本索引（索引换成合并后的）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_target_on_gitlab_refreshes_the_latest_index() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let api = "/api/v4/projects/team%2Fim";
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "{api}/packages/generic/demo-im/0.4.0/hhhim-release.json"
+            )))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "{api}/packages/generic/demo-im/0.4.0/demo-im-0.4.0-windows-x64.hhhim"
+            )))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{api}/releases/v0.4.0")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"_links":{"self":"https://git.example.com/team/im/-/releases/v0.4.0"},"assets":{"links":[{"name":"hhhim-release.json"}]}}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("{api}/releases/v0.4.0/assets/links")))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "{api}/packages/generic/demo-im/latest/hhhim-release.json"
+            )))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (package, index) = files(dir.path());
+        let publish = publisher(
+            Source::Gitlab {
+                host: "https://git.example.com".into(),
+                project: "team/im".into(),
+            },
+            &server.uri(),
+        );
+        tokio::task::spawn_blocking(move || publish.upload("demo-im", &[&package, &index], ""))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // 项目不允许同名重传时，说清是项目设置的问题、怎么改（不是令牌不对）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_that_forbids_duplicates_says_how_to_allow_them() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let api = "/api/v4/projects/team%2Fim";
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "{api}/packages/generic/demo-im/latest/hhhim-release.json"
+            )))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"message":"403 Forbidden - Duplicate package is not allowed"}"#,
+            ))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (_, index) = files(dir.path());
+        let publish = publisher(
+            Source::Gitlab {
+                host: "https://git.example.com".into(),
+                project: "team/im".into(),
+            },
+            &server.uri(),
+        );
+        let base = format!("{}{api}", server.uri());
+        let error =
+            tokio::task::spawn_blocking(move || publish.put_latest(&base, "demo-im", &index))
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(
+            error.contains("不允许同名重传") && error.contains("包与仓库"),
+            "{error}"
+        );
+    }
+
+    // --latest-only：读回仓库里这个版本的索引原文，一个字节不改地放到 latest/（官方签名对的是原文），不传包。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_only_copies_the_published_index_byte_for_byte() {
+        use wiremock::matchers::{body_string, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let api = "/api/v4/projects/team%2Fim";
+        // 原文带缩进与换行：重新写出来会变样，必须原样复制。
+        let raw = "{\n  \"indexVersion\": 1,\n  \"id\": \"demo-im\",\n  \"version\": \"0.4.0\",\n  \"notes\": \"\",\n  \"packages\": []\n}\n";
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "{api}/packages/generic/demo-im/0.4.0/hhhim-release.json"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_string(raw))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "{api}/packages/generic/demo-im/latest/hhhim-release.json"
+            )))
+            .and(body_string(raw))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("dist");
+        let publish = publisher(
+            Source::Gitlab {
+                host: "https://git.example.com".into(),
+                project: "team/im".into(),
+            },
+            &server.uri(),
+        );
+        let done = {
+            let scratch = scratch.clone();
+            tokio::task::spawn_blocking(move || publish.publish_latest_only("demo-im", &scratch))
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        assert!(done.contains("补上最新版本索引"), "{done}");
+        assert!(
+            std::fs::read_dir(&scratch).unwrap().next().is_none(),
+            "临时文件传完就删"
+        );
+        let uploads = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .count();
+        assert_eq!(uploads, 1, "只放索引，不传包");
+    }
+
+    // --latest-only：这个版本还没发布、来源是 GitHub、索引写的是别的插件时都说清。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_only_refuses_what_it_cannot_fill() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/projects/team%2Fim/packages/generic/demo-im/0.4.0/hhhim-release.json",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/projects/team%2Fim/packages/generic/other-im/0.4.0/hhhim-release.json",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"indexVersion":1,"id":"demo-im","version":"0.4.0","notes":"","packages":[]}"#,
+            ))
+            .mount(&server)
+            .await;
+        let gitlab = Source::Gitlab {
+            host: "https://git.example.com".into(),
+            project: "team/im".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().to_path_buf();
+        let uri = server.uri();
+        let (missing, other, github) = tokio::task::spawn_blocking(move || {
+            (
+                publisher(gitlab.clone(), &uri).publish_latest_only("demo-im", &scratch),
+                publisher(gitlab, &uri).publish_latest_only("other-im", &scratch),
+                publisher(Source::Github { repo: "a/b".into() }, &uri)
+                    .publish_latest_only("demo-im", &scratch),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(missing.unwrap_err().contains("先用 --publish"));
+        assert!(other.unwrap_err().contains("对不上"));
+        assert!(github.unwrap_err().contains("GitHub"));
     }
 
     // 第二台电脑补传别的目标：读回 GitHub 上同一版本已有的索引文件本身。附件地址只带一条

@@ -22,7 +22,7 @@
 
 ```toml
 [dependencies]
-hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.6.1", features = ["runtime"] }
+hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.7.0", features = ["runtime"] }
 ```
 
 运行时（`hhh_im_protocol::runtime`）管每个插件都要的、和平台无关的那一半：读写标准输入输出、宿主的请求各开一个任务并发处理、
@@ -30,15 +30,20 @@ hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.6
 向平台发了几次请求。插件实现 `Plugin`（收到某个方法怎么办），交给 `serve_on` / `serve_stdio` / `serve_stdio_on`；模板仓库就是这样写的。
 编成 `wasm32-wasip2` 给 iPhone / iPad 用时，`serve_stdio*` 在 WASI 上自己接好标准输入输出（见 `docs/release.md` §2）。
 
+账号级操作可声明 shortcut:true，让宿主在会话区显示快捷入口；操作完成可返回 openConversationId，支持宿主核对并打开结果会话（旧宿主可忽略）。详见协议 §6.7。
+
 装两个工具：
 
 ```sh
-cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.6.1 hhh-im-protocol --features transport,package
+cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.7.0 hhh-im-protocol --features transport,package
 ```
 
 - 自检：`hhh-im-check <插件文件夹>/hhh-im-provider.json`
 - 打包：`hhh-im-pack <插件文件夹> --target windows-x64`（不写 `--target` 用这台电脑的目标）
 - 发布：`hhh-im-pack <插件文件夹> --notes notes.md --publish`，令牌放环境变量 `HHH_IM_PUBLISH_TOKEN`（GitHub 也认 `GITHUB_TOKEN`，GitLab 也认 `GITLAB_TOKEN`），不写进任何文件
+- GitLab 发布会同时更新包仓库的最新版本索引；旧版本可用 `hhh-im-pack <插件文件夹> --publish --latest-only` 只补索引，清单版本必须已发布
+
+私有插件的拥有者可在支持分享码的 HHH 中点「管理 → 分享…」，朋友粘贴分享码安装和更新。GitHub 的清单 `source` 应指向单独的发布仓库，只放安装包与版本索引；GitLab 分享使用只读包仓库的部署令牌。发布令牌留在发布者电脑，不能当分享码发给朋友。详见 [发版本规范](docs/release.md)。
 
 从零起一个插件，用模板仓库 [hhh-im-plugin-template](https://github.com/MagicLizi/hhh-im-plugin-template)：清单、标志、插件骨架、打包脚本、
 给 agent 的规范都在里面。
