@@ -59,6 +59,8 @@ pub enum Method {
     // —— 凭据与授权（插件→宿主）——
     /// 保存凭据（插件→宿主）。
     CredentialSave,
+    /// 每条平台读取发出前申请额度（插件→宿主）。
+    RequestsAcquire,
     /// 授权失效（插件→宿主通知）。
     SessionExpired,
     /// 这个连接现在有的问题（插件→宿主通知，契约 provider-protocol v12 缺口 5）。
@@ -159,6 +161,7 @@ impl Method {
             Method::ActionFailed => "action/failed",
             Method::StepChoose => "step/choose",
             Method::CredentialSave => "credential/save",
+            Method::RequestsAcquire => "requests/acquire",
             Method::SessionExpired => "session/expired",
             Method::SessionNotice => "session/notice",
             Method::SessionRenew => "session/renew",
@@ -229,6 +232,7 @@ impl Method {
             Method::ActionFailed,
             Method::StepChoose,
             Method::CredentialSave,
+            Method::RequestsAcquire,
             Method::SessionExpired,
             Method::SessionNotice,
             Method::SessionRenew,
@@ -315,6 +319,10 @@ pub struct InitializeResult {
     pub platform: PlatformDesc,
     /// 能力清单。
     pub capabilities: Capabilities,
+    /// 每条平台读取都支持先向宿主申请额度（`requests/acquire`）；宿主在读取参数的 `_meta.readPermit` 中给出凭据。
+    /// 默认关闭；旧插件继续用结果里的 `platformRequests` 结算。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_request_gating: bool,
     /// 程序设置项。
     #[serde(default)]
     pub settings: Vec<SettingDecl>,

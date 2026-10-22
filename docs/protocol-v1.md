@@ -111,6 +111,7 @@
 
 - `protocolVersion` 必须是宿主列出的版本之一，否则宿主拒绝连接，并提示“程序版本与 HHH 不兼容”。
 - `provider.id` 必须和清单里的一致。
+- 结果可声明 `readRequestGating: true`，表示每条平台读取都支持发送前向宿主申请额度（§8）；默认关闭，旧程序和旧宿主仍按 `platformRequests` 结算。
 - 宿主保存最近一次收到的平台说明。没连上程序时，宿主按这份说明只读打开本地库。
 - `network.proxy` 是 HHH 的出站代理设置。程序访问平台时应当照这个设置走，这样用户在 HHH 里设的网络规则对程序也生效。
 - 超时 10 秒。
@@ -172,7 +173,7 @@
 | `limits` | `{imageUploadMaxBytes, fileUploadMaxBytes, attachmentNameMaxBytes}` | 能发图片或文件时必需 | 发送附件的上限 |
 | `readDefaults` | 读取间隔（秒） | 否 | 默认读取间隔，字段同 hhh-im 的 `ReadIntervals`，另可写 `discover`（会话发现间隔，v12）。超出宿主允许范围的值会被拒绝 |
 | `userAdjustable` | 字符串数组 | 否 | v12。开放给用户在「参数配置 → 读取与下载」里改的项：`readIntervals`（读取频率一组）、`pageMax`、`readsPerSecond`、`readsPerMinute`、`downloadsPerSecond`、`downloadsPerMinute`、`fileSegmentBytes`。叫法、单位、控件由宿主统一，默认值取本平台说明里写的；改了立即生效。不认识的取值宿主忽略。一项都不写就没有这一组 |
-| `discovery` | `{fastestSecs, pages, coldPages}` | 否 | v12。会话发现：宿主定时问程序一段时间里有人发过消息的会话（`conversations/recentActivity`，§8），把不在列表里的加进会话列表。`fastestSecs` 是最快多久问一次，`pages` / `coldPages` 是平常与刚启动时一次最多翻几页。要同时声明能力 `conversations.recentActivity` 才生效 |
+| `discovery` | `{fastestSecs, pages, coldPages}` | 否 | v12。会话发现：宿主定时找一段时间里有人发过消息、不在列表里的会话，加进会话列表。声明了能力 `conversations.recentActivity` 时问程序（`conversations/recentActivity`，§8）；没有它但同时声明 `conversations.list` 与 `messages.list` 时，宿主自己逐会话限频探测（`conversations/list` 列会话，每个不在列表里的再 `messages/list` 读起点之后最新几条，请求按 `reads` 额度排在后台）；都没有不发现。`fastestSecs` 是最快多久找一次，`pages` / `coldPages` 是平常与刚启动时一次最多翻几页（账号级查询翻结果页，逐会话探测翻会话列表页） |
 | `editsByContent` | 字符串数组 | 否 | v12。平台不给“改过”标记时，宿主按内容认编辑：这里列出的内容块种类（`text`、`mention`、`rich`）真变了、时间往后才算编辑过。不写就只认 `editedAtMs` |
 | `retranslateRules` | `[{name, formats?}]` | 否 | v12。程序现在的翻译规则名，按顺序（§10.1）。`formats` 给了就只把 `raw.format` 在其中的旧消息交给这条规则。至多 32 条，名字不能重复 |
 | `contentRepairs` | 字符串数组 | 否 | 一次性本地修正规则名，按依赖顺序执行（§10.2），须同时声明 `messageMaintenance` |
@@ -473,7 +474,9 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 | `conversations/recentActivity` | `sinceMs`、`pagesMax` | `{items: [{conversationId, kind, firstMs, latestMs, peerId?, conversation?}], complete}`：这段时间里有人（不算机器人、应用、经接口发的）发过消息的会话，每个会话一项，按最新一条从新到旧；只用来认会话，不交出消息内容；`peerId` 是私聊的对方；`conversation`（v15，可选）是群与频道的资料（§7.2 的 Conversation），程序手边正好有时给，宿主就不再为它读一次 `conversations/get`，私聊不给；翻满 `pagesMax` 页还没到起点时 `complete` 为假。一次至多 1000 项（v12） | `conversations.recentActivity` |
 
 - `messages/list` 的翻页规则同 hhh-im 的 `MessageQuery`：`newestFirst` 为真时，从最新往更早翻。
-- **这次向平台发了几个请求**（v14，可选）：上表每个方法的结果对象都可以多带 `"platformRequests": <正整数>`。宿主每调一次先记一次平台读取，多出的照样记进这个平台的读取额度（一次调用至多按 64 个记），之后的读取据此等；不写就是 1。
+- **发送前申请额度**（可选）：程序在 `initialize` 声明 `readRequestGating: true` 后，支持此扩展的宿主给上表读取的参数添加 `_meta: {readPermit: "不透明凭据"}`。程序每次发平台 HTTP 读取前，先反向请求 `requests/acquire {permit: "该凭据"}`，只有收到 `{granted: true}` 才能发送这一条；收到错误、空回执或连接断开时停止，不可自行补发。凭据只属于当前连接里的这次读取，不能保存、跨调用复用或用于写操作。
+- 同一次读取逐条等额度；宿主沿用原读取单元的优先级、预付额度和取消状态，等待额度不阻塞其他协议消息，也不套插件请求宿主的普通 30 秒时限。读取结束或取消后凭据立即失效。SDK 插件在唯一读取出口用 `runtime::metering::read_request().await?`，没有 `_meta.readPermit` 的旧宿主自动退回计数模式。
+- **这次向平台发了几个请求**（v14，可选）：上表每个方法的结果对象都可以多带 `"platformRequests": <正整数>`。没有协商发送前申请额度时，宿主每调一次先记一次平台读取，多出的在结果返回后记进这个平台的读取额度（一次调用至多按 64 个记），之后的读取据此等；不写就是 1。已逐条放行的调用不再按这个字段重复扣额度。
 - **读取不能有副作用**：不能借读取在平台上标已读，也不能改变在线状态。已读未读只在 HHH 本地计算。
 - Emoji 的字段同 hhh-im 的 `EmojiInfo`，只是图片地址换成 `emoji/image` 用的编号。
 
@@ -815,3 +818,4 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 - 2026-10-12（契约 v13，全部为可选的加法，主版本仍是 1）：登录方式 `host` 与 `login/start` 的 `values.hostToken`、`hostAccount`（宿主账号登录、自动开始）；`initialize.actions` 与 `actions/start`（结果可带 `title`）、`action/step`、`action/submit`、`action/cancel`、`action/finished`、`action/failed`（插件操作，§6.7）；步骤 `showText`、`list`、`confirm`，每一步的 `links`，`input` 的 `caption`、`submitLabel`，`cancelLabel`、`cancelChoice`、`noCancel`，以及 `step/choose`；`login/finished` 的 `title`、`message` 与 `login/failed` 的 `title`、`retryLabel`；`session/notice` 每条的 `action`、`prompt`；“保留编号”改为宿主官方列表里的编号，只有同编号的内置平台存在时平台编号才是编号本身、才顶替；§14 新预算；§17 新检查。
 - 2026-10-12（契约 v15，可选的加法，主版本仍是 1）：能力 `people.bots` 与 `people/get` 的 `bots`（按编号读机器人与应用）、`people.batchMax`（一次读人的上限）；宿主照 `people/get` 的结果办——只把 `missing` 记成“没有”，两边都没有的下次再读（以前没返回的一律记“没有”）；提及所有人可带平台的叫法（`mention` 的 `name`，内容块与格式正文里都是）；会话发现的一项可带群与频道的资料（`conversation`）；协议包的插件运行时（`runtime` 部件）与格式正文、卡片的类型（`content` 模块）。
 - 2026-10-16（契约 v19，可选的加法，主版本仍是 1）：`action/finished` 的 `removeFromList`（会话级操作做完后让会话离开宿主的列表，等同取消关注；不认识它的旧宿主只关对话框）。
+- 2026-10-21（hhh-im client 契约 v37，主版本仍是 1）：声明了 `discovery`、没有 `conversations.recentActivity` 但能列会话与读消息的程序，由宿主逐会话限频发现会话（原先这种声明不生效）；程序不用新增方法。

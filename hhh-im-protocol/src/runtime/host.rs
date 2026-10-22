@@ -49,6 +49,23 @@ struct Inner {
 #[derive(Clone)]
 pub struct Host(Arc<Inner>);
 
+/// 等待被取消时也移除回执，避免一次读取取消后留下无人接收的条目。
+struct PendingRequest {
+    host: Host,
+    id: String,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.host
+            .0
+            .waiting
+            .lock()
+            .expect("在等的请求表锁中毒")
+            .remove(&self.id);
+    }
+}
+
 impl std::fmt::Debug for Host {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Host")
@@ -76,6 +93,7 @@ impl Host {
 
     /// 输入读完：排着的写完后写手停下，之后再发的丢掉。
     pub(super) fn close(&self) {
+        self.0.waiting.lock().expect("在等的请求表锁中毒").clear();
         let _ = self.0.out.send(Out::Close);
     }
 
@@ -100,6 +118,25 @@ impl Host {
     /// # Errors
     /// 宿主回了错误、连接断了或等太久时返回错误（等太久与断了是 `disconnected`）。
     pub async fn request(&self, method: &str, params: impl Serialize) -> Result<Value, RpcError> {
+        self.request_wait(method, params, Some(REPLY_WAIT)).await
+    }
+
+    /// 读取额度可能要等过一分钟；由原读取的取消与连接断开结束等待，不套凭据保存的 30 秒时限。
+    pub(super) async fn request_read_permit(&self, permit: &str) -> Result<Value, RpcError> {
+        self.request_wait(
+            "requests/acquire",
+            serde_json::json!({"permit":permit}),
+            None,
+        )
+        .await
+    }
+
+    async fn request_wait(
+        &self,
+        method: &str,
+        params: impl Serialize,
+        timeout: Option<Duration>,
+    ) -> Result<Value, RpcError> {
         let params = serde_json::to_value(params).map_err(|error| {
             RpcError::from_kind(
                 ErrorKind::ProtocolError,
@@ -113,22 +150,25 @@ impl Host {
             .lock()
             .expect("在等的请求表锁中毒")
             .insert(id.clone(), tx);
+        let _pending = PendingRequest {
+            host: self.clone(),
+            id: id.clone(),
+        };
         self.send(RpcMessage::request(RpcId::Text(id.clone()), method, params));
-        let reply = tokio::time::timeout(REPLY_WAIT, rx).await;
-        self.0
-            .waiting
-            .lock()
-            .expect("在等的请求表锁中毒")
-            .remove(&id);
+        let reply = match timeout {
+            Some(wait) => tokio::time::timeout(wait, rx).await.map_err(|_| {
+                RpcError::from_kind(
+                    ErrorKind::Disconnected,
+                    format!("宿主没有在 {} 秒内回复 {method}。", wait.as_secs()),
+                )
+            })?,
+            None => rx.await,
+        };
         match reply {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(RpcError::from_kind(
-                ErrorKind::Disconnected,
-                "和宿主的连接已经断了。",
-            )),
+            Ok(result) => result,
             Err(_) => Err(RpcError::from_kind(
                 ErrorKind::Disconnected,
-                format!("宿主没有在 {} 秒内回复 {method}。", REPLY_WAIT.as_secs()),
+                "和宿主的连接已经断了。",
             )),
         }
     }
@@ -154,5 +194,23 @@ impl Host {
             (None, None) => Ok(Value::Null),
         };
         let _ = waiting.send(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelling_a_read_permit_removes_its_waiting_reply() {
+        let (host, mut writes) = Host::new();
+        let calling = host.clone();
+        let waiting = tokio::spawn(async move { calling.request_read_permit("r1").await });
+        let ask = writes.next().await.unwrap();
+        assert_eq!(ask.method.as_deref(), Some("requests/acquire"));
+        assert_eq!(host.0.waiting.lock().unwrap().len(), 1);
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert!(host.0.waiting.lock().unwrap().is_empty());
     }
 }

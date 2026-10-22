@@ -33,6 +33,14 @@ impl Plugin for Small {
                 }
                 Reply::from(Ok(json!({ "items": [] })))
             }
+            "gated" => {
+                for _ in 0..3 {
+                    if let Err(error) = metering::read_request().await {
+                        return Reply::from(Err(error));
+                    }
+                }
+                Reply::from(Ok(json!({"items":[]})))
+            }
             "self" => {
                 call.host
                     .respond(call.id.clone(), Ok(json!({ "started": true })));
@@ -87,6 +95,60 @@ fn start() -> (FakeHost, tokio::task::JoinHandle<()>) {
 
 fn request(id: i64, method: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": {} })
+}
+
+// 没协商新能力时不发回调，旧宿主照旧从结果结算平台请求数。
+#[tokio::test]
+async fn read_gating_keeps_legacy_hosts_on_result_counting() {
+    let (mut host, _server) = start();
+    host.send(request(1, "gated")).await;
+    let reply = host.next().await;
+    assert_eq!(reply["id"], 1);
+    assert_eq!(reply["result"]["platformRequests"], 3);
+}
+
+// 等额度期间还能回心跳；每次明确放行只放一条，拒绝时结束原读取。
+#[tokio::test]
+async fn each_read_waits_for_a_grant_without_blocking_other_calls() {
+    let (mut host, _server) = start();
+    let mut read = request(1, "gated");
+    read["params"]["_meta"] = json!({"readPermit":"r7"});
+    host.send(read).await;
+    let first = host.next().await;
+    assert_eq!(first["method"], "requests/acquire");
+    assert_eq!(first["params"]["permit"], "r7");
+    host.send(request(2, "fast")).await;
+    assert_eq!(host.next().await["id"], 2, "读取等额度时其他请求仍完成");
+    host.send(json!({"jsonrpc":"2.0","id":first["id"],"result":{"granted":true}}))
+        .await;
+    let second = host.next().await;
+    assert_eq!(second["method"], "requests/acquire");
+    host.send(
+        serde_json::to_value(RpcMessage::err(
+            serde_json::from_value(second["id"].clone()).unwrap(),
+            RpcError::from_kind(ErrorKind::Cancelled, "读取不再需要"),
+        ))
+        .unwrap(),
+    )
+    .await;
+    let stopped = host.next().await;
+    assert_eq!(stopped["id"], 1);
+    assert_eq!(stopped["error"]["data"]["kind"], "cancelled");
+}
+
+// 老宿主对未知方法可能回空对象，不能误当放行。
+#[tokio::test]
+async fn an_empty_acknowledgement_never_grants_a_platform_read() {
+    let (mut host, _server) = start();
+    let mut read = request(1, "gated");
+    read["params"]["_meta"] = json!({"readPermit":"r8"});
+    host.send(read).await;
+    let ask = host.next().await;
+    host.send(json!({"jsonrpc":"2.0","id":ask["id"],"result":{}}))
+        .await;
+    let refused = host.next().await;
+    assert_eq!(refused["id"], 1);
+    assert_eq!(refused["error"]["data"]["kind"], "protocolError");
 }
 
 // 请求并发：慢的不挡快的；`$/cancel` 停掉慢的并回“已取消”。

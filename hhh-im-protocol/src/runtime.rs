@@ -262,6 +262,7 @@ fn receive<P: Plugin>(
         return;
     };
     let key = id.to_string();
+    let permit = params.pointer("/_meta/readPermit").cloned();
     let call = Call {
         id: id.clone(),
         method,
@@ -272,7 +273,9 @@ fn receive<P: Plugin>(
     // 先拿着任务表再开任务：任务做完删自己那一项时，表里一定已经记上了。
     let mut guard = tasks.lock().expect("任务表锁中毒");
     let task = tokio::spawn(async move {
-        let (reply, sent) = metering::counted(plugin.request(call)).await;
+        let (reply, sent) =
+            metering::counted_with_permit(plugin.request(call), host_for_task.clone(), permit)
+                .await;
         if let Reply::Result(result) = reply {
             host_for_task.respond(id.clone(), with_platform_requests(result, sent));
         }

@@ -261,7 +261,7 @@ pub struct ReadIntervalsSecs {
     pub discover: Option<u64>,
 }
 
-/// 会话发现（契约 provider-protocol v12 缺口 1）：插件能列出一段时间里有人发过消息的会话（`conversations/recentActivity`）时给。
+/// 会话发现参数（契约 provider-protocol v12 缺口 1）：插件能提供账号级活动查询，或能列出会话并按时间读消息供宿主逐会话限频探测时给。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryDesc {
@@ -498,7 +498,7 @@ pub struct PlatformDesc {
     /// 表情规则（有表情能力时给）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emoji: Option<EmojiRules>,
-    /// 会话发现（声明了 `conversations.recentActivity` 时给）。
+    /// 会话发现参数；宿主按能力选择账号级 `conversations/recentActivity`，或按会话列表与消息读取做限频探测。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery: Option<DiscoveryDesc>,
     /// 开放给用户改的读取与下载项；不写就一项都不开放。
