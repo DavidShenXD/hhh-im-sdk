@@ -61,6 +61,8 @@ pub enum Method {
     CredentialSave,
     /// 每条平台读取发出前申请额度（插件→宿主）。
     RequestsAcquire,
+    /// 插件确认收到读取许可（通知，握手后的逐请求可选回执）。
+    RequestsReceived,
     /// 授权失效（插件→宿主通知）。
     SessionExpired,
     /// 这个连接现在有的问题（插件→宿主通知，契约 provider-protocol v12 缺口 5）。
@@ -162,6 +164,7 @@ impl Method {
             Method::StepChoose => "step/choose",
             Method::CredentialSave => "credential/save",
             Method::RequestsAcquire => "requests/acquire",
+            Method::RequestsReceived => "requests/received",
             Method::SessionExpired => "session/expired",
             Method::SessionNotice => "session/notice",
             Method::SessionRenew => "session/renew",
@@ -233,6 +236,7 @@ impl Method {
             Method::StepChoose,
             Method::CredentialSave,
             Method::RequestsAcquire,
+            Method::RequestsReceived,
             Method::SessionExpired,
             Method::SessionNotice,
             Method::SessionRenew,

@@ -125,7 +125,7 @@ impl Host {
     pub(super) async fn request_read_permit(&self, permit: &str) -> Result<Value, RpcError> {
         self.request_wait(
             "requests/acquire",
-            serde_json::json!({"permit":permit}),
+            serde_json::json!({"permit":permit,"receipt":true}),
             None,
         )
         .await

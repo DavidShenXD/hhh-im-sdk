@@ -136,6 +136,40 @@ async fn each_read_waits_for_a_grant_without_blocking_other_calls() {
     assert_eq!(stopped["error"]["data"]["kind"], "cancelled");
 }
 
+// 每次平台读取前先确认许可交付；不把网络响应完成当作回执。
+#[tokio::test]
+async fn a_read_receipt_precedes_the_next_platform_request() {
+    let (mut host, _server) = start();
+    let mut read = request(1, "gated");
+    read["params"]["_meta"] = json!({"readPermit":"r-receipt"});
+    host.send(read).await;
+    let ask = host.next().await;
+    assert_eq!(ask["params"]["receipt"], true, "主动协商许可回执");
+    host.send(
+        json!({"jsonrpc":"2.0","id":ask["id"],"result":{"granted":true,"receipt":"issued-1"}}),
+    )
+    .await;
+    let received = host.next().await;
+    assert_eq!(received["method"], "requests/received");
+    assert_eq!(received["params"]["receipt"], "issued-1");
+    assert!(received.get("id").is_none(), "回执是通知，不等网络读取完成");
+    assert_eq!(host.next().await["method"], "requests/acquire");
+}
+
+#[tokio::test]
+async fn an_invalid_read_receipt_does_not_start_the_platform_request() {
+    let (mut host, _server) = start();
+    let mut read = request(1, "gated");
+    read["params"]["_meta"] = json!({"readPermit":"r-invalid-receipt"});
+    host.send(read).await;
+    let ask = host.next().await;
+    host.send(json!({"jsonrpc":"2.0","id":ask["id"],"result":{"granted":true,"receipt":""}}))
+        .await;
+    let refused = host.next().await;
+    assert_eq!(refused["id"], 1);
+    assert_eq!(refused["error"]["data"]["kind"], "protocolError");
+}
+
 // 老宿主对未知方法可能回空对象，不能误当放行。
 #[tokio::test]
 async fn an_empty_acknowledgement_never_grants_a_platform_read() {

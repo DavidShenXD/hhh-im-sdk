@@ -22,13 +22,13 @@
 
 ```toml
 [dependencies]
-hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.8.0", features = ["runtime"] }
+hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.9.0", features = ["runtime"] }
 ```
 
 运行时（`hhh_im_protocol::runtime`）管每个插件都要的、和平台无关的那一半：读写标准输入输出、宿主的请求各开一个任务并发处理、
 `$/cancel`、向宿主发请求并等回复（`credential/save`、`events/push`）、日志转 `log/write`、资源分段读、上传攒齐与核对、
 向平台发了几次请求。插件实现 `Plugin`（收到某个方法怎么办），交给 `serve_on` / `serve_stdio` / `serve_stdio_on`；模板仓库就是这样写的。
-声明 `readRequestGating` 后，在每条平台读取出口等待 `metering::read_request().await?`，宿主放行后再发 HTTP；旧宿主没有给额度凭据时仍按结果计数。详见协议 §8。
+声明 `readRequestGating` 后，在每条平台读取出口等待 `metering::read_request().await?`，宿主放行后再发 HTTP；运行时自动确认支持回执的许可，避免通信恢复时积攒许可集中生效。旧宿主没有给额度凭据时仍按结果计数。详见协议 §8。
 编成 `wasm32-wasip2` 给 iPhone / iPad 用时，`serve_stdio*` 在 WASI 上自己接好标准输入输出（见 `docs/release.md` §2）。
 
 账号级操作可声明 shortcut:true，让宿主在会话区显示快捷入口；操作完成可返回 openConversationId，支持宿主核对并打开结果会话（旧宿主可忽略）。详见协议 §6.7。
@@ -36,7 +36,7 @@ hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.8
 装两个工具：
 
 ```sh
-cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.8.0 hhh-im-protocol --features transport,package
+cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.9.0 hhh-im-protocol --features transport,package
 ```
 
 - 自检：`hhh-im-check <插件文件夹>/hhh-im-provider.json`

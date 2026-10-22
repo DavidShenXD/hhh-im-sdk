@@ -53,6 +53,16 @@ pub async fn read_request() -> Result<(), RpcError> {
                 "宿主没有明确放行这次平台读取。",
             ));
         }
+        if let Some(receipt) = granted.get("receipt") {
+            let receipt = receipt
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 128)
+                .ok_or_else(|| {
+                    RpcError::from_kind(ErrorKind::ProtocolError, "宿主的读取回执编号无效。")
+                })?;
+            // 收到许可就确认，不等 HTTP 完成。宿主以收到回执的时刻重新计时，通信暂停时不会积攒许可。
+            host.notify("requests/received", serde_json::json!({"receipt":receipt}));
+        }
     }
     request();
     Ok(())
