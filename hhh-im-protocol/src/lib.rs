@@ -69,6 +69,10 @@ pub mod budget {
     pub const LOGIN_NOTE_MAX_CHARS: usize = 200;
     /// logo 最大字节数。
     pub const LOGO_MAX_BYTES: usize = 256 * 1024;
+    /// `account/avatar` 交给插件的头像最大字节数（契约 provider-protocol v35）。
+    pub const HOST_AVATAR_MAX_BYTES: usize = 256 * 1024;
+    /// `account/avatar` 交给插件的头像最大边长（像素）。
+    pub const HOST_AVATAR_MAX_SIDE: u32 = 256;
     /// 凭据最大字节数。
     pub const CREDENTIAL_MAX_BYTES: usize = 64 * 1024;
     /// 单条消息的 `raw` 原始数据最大字节数。

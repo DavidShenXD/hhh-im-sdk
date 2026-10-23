@@ -606,6 +606,24 @@ pub struct Capabilities {
     /// 会话（账号）能力。
     #[serde(default, skip_serializing_if = "SessionCaps::is_empty")]
     pub session: SessionCaps,
+    /// 本人账号资料能力（契约 provider-protocol v35）。
+    #[serde(default, skip_serializing_if = "AccountCaps::is_empty")]
+    pub account: AccountCaps,
+}
+
+/// 本人账号资料能力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCaps {
+    /// 收宿主交来的本机用户头像（`account/avatar`），拿去设置本人在这家 IM 里的头像。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_avatar: bool,
+}
+
+impl AccountCaps {
+    fn is_empty(&self) -> bool {
+        !self.host_avatar
+    }
 }
 
 /// 会话能力。
@@ -1191,6 +1209,25 @@ mod tests {
             [Adjustable::ReadIntervals, Adjustable::Unknown]
         );
         assert_eq!(future.edits_by_content, [ContentKind::Unknown]);
+    }
+
+    // 契约 provider-protocol v35：`account.hostAvatar` 可选；没声明时线上不出现 `account`，旧形状写回不多出键。
+    #[test]
+    fn v35_account_caps_are_optional_and_round_trip() {
+        use serde_json::json;
+        let old: Capabilities =
+            serde_json::from_value(json!({ "conversations": { "list": true } })).unwrap();
+        assert!(!old.account.host_avatar);
+        assert!(serde_json::to_value(&old).unwrap().get("account").is_none());
+        let new: Capabilities = serde_json::from_value(
+            json!({ "conversations": { "list": true }, "account": { "hostAvatar": true } }),
+        )
+        .unwrap();
+        assert!(new.account.host_avatar);
+        assert_eq!(
+            serde_json::to_value(&new).unwrap()["account"],
+            json!({ "hostAvatar": true })
+        );
     }
 
     #[test]

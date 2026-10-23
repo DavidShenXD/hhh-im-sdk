@@ -229,6 +229,7 @@
 
 - v12：`conversations.recentActivity` 为真时程序能回答 `conversations/recentActivity`（会话发现，§8）；`session.renew` 为真时程序能用存着的凭据续期（`session/renew`，§6.6）。
 - v15：`people.bots` 为真时程序能按编号读机器人与应用（`people/get` 的 `bots`），要先声明 `people.get`；不写时宿主把机器人一律记成“没有”、不为它们问程序。`people.batchMax`（1–2000）是一次 `people/get` 最多问几个，平台一次读一大批更省时写（如读一遍整份成员名单就认出一大批人）；不写是 100。
+- v35：`account.hostAvatar` 为真时程序收宿主交来的本机用户头像（`account/avatar`，§6.8），拿去设置本人在这家 IM 里的头像；不写时宿主不交，线上不出现 `account`。
 
 - `retranslate` 为真时，程序随消息附带去凭据化的原始数据（§7.4 的 `raw`），宿主存一张原始数据表；程序翻译规则升级后，宿主调 `messages/retranslate`（§10.1）让它把本地旧消息重新翻译一遍。为假时不附带原始数据、也不会被调用重译。
 - `messageMaintenance`（可选，默认假）允许宿主把已存的统一消息交给程序做本地修正或重读判定，不依赖 `raw`，不替代 `retranslate`。旧程序省略此能力照常接入。
@@ -285,7 +286,7 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 | `relay` | 中继地址（`values.relayUrl`） | 必填；https 网址，或本机回环的 http；只填网址本身 |
 | `ownApp` | App ID、App Secret（`values.appId`、`values.appSecret`） | App ID 必填；第一次用或换了 App ID 要填 Secret，不填沿用已保存的 |
 | `direct` | 不用填 | 点“登录”后照程序推来的步骤走 |
-| `host`（v13） | 不用填 | 只给宿主允许的程序（Friend：带官方签名的）；宿主在 `values.hostToken` 给当前宿主账号的访问令牌、在 `hostAccount: {name, detail, avatarUrl?}` 给这个账号（名字、个人或组织的一行说明、头像地址），没有宿主账号（游客）时这一类不能点 |
+| `host`（v13） | 不用填 | 只给宿主允许的程序（Friend：带官方签名的）；宿主在 `values.hostToken` 给当前宿主账号的访问令牌、在 `hostAccount: {name, detail, avatarUrl?}` 给这个账号（名字、个人或组织的一行说明；`avatarUrl` 自 v35 起宿主不再填，本人头像改由 `account/avatar` 交，§6.8），没有宿主账号（游客）时这一类不能点 |
 
 - 叫法、说明、灰字、链接文字由程序写，每段至多 200 字；链接只收 https。至多 8 种，`id` 不重复；宿主不认识的 `kind` 不登记那一种。
 - **登录成功才保存**：`login/finished` 且凭据已存好之后，宿主保存这次的方式与填的内容（Secret 进系统凭据库），换了方式就删掉另一种的；失败、取消什么都不动。
@@ -366,6 +367,12 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 - 用户点了，宿主叫 `actions/start {actionId, conversationId?}`（会话级操作给平台会话编号），程序回 `{flowId, title?}`（`title` 是对话框的标题，至多 200 字，如提醒上的“查看”点开后写“批准新电脑”；不给时宿主用操作的名字，会话级的写“操作名 · 会话名”），之后发 `action/step {flowId, step}` 一步步走（步骤与登录同一套，§6.1），以 `action/finished {flowId, title?, message?, removeFromList?, openConversationId?}` 或 `action/failed {flowId, message, retryable, title?, retryLabel?}` 结束：`action/finished` 给了 `title` 或 `message` 时宿主换成成功页，都不给就直接关掉；能重试时重试就是再开始一次这项操作。`removeFromList: true`（v19）只对会话级操作有效：做完后宿主把这个会话从列表里拿掉，等同取消关注——关注内容与本机记录都留着、平台上的会话不动，这个会话以后有新消息时照常回到列表；账号级操作带了宿主不理会。表单一步提交是 `action/submit {flowId, values}`，用户关掉是 `action/cancel {flowId}`，选择是 `step/choose`（这三个同 `login/submit`、`login/cancel`，都是宿主→程序通知）。
 - action/finished 可带 openConversationId：当前账号内操作实际完成的会话编号，遵守 §7 的编号规则。宿主用同一账号连接重新读取并核对会话，再保存关注、打开结果；已有关注保留配置。取消或别的流程不打开。读取或保存失败时操作仍算成功，只提示暂时未打开，不能重试创建。removeFromList 同时存在时优先移除。旧宿主忽略新增字段，旧插件继续原有行为。
 - 宿主用登录框同一个对话框，标题是操作的名字（会话级的写“操作名 · 会话名”）。同一个程序同一时间只走一个流程（登录或操作）；新的 `actions/start` 或 `login/start` 取消还没结束的旧流程。
+
+### 6.8 本机用户头像（v35，可选）
+
+- 声明了 `account.hostAvatar` 的程序，宿主在会话上线后、以及用户换了头像（或用默认头像时改了名字）之后，叫 `account/avatar {avatar}`（宿主→程序请求）：`avatar` 是 `{mime, data, sha256, size}`——`mime` 只用 `image/png` 或 `image/jpeg`，`data` 是图片字节的 base64，`sha256` 是 64 位小写十六进制，`size` 是字节数；宿主已经缩到边长 256 以内、256 KiB 以内。`avatar: null` 表示这个用户没有任何头像可交。
+- 程序收下回空结果；拿去做什么（设成本人在这家 IM 的头像、发给好友）由程序决定。同一张图可能重复收到（重连、内容没变），按 `sha256` 自己去重。处理失败回错误，宿主只记日志，下次上线或下次变化再交。
+- 连续几次变化宿主只交最后一张；没声明的程序永远收不到。
 
 ## 7. 数据模型
 
@@ -685,6 +692,7 @@ JSON-RPC 的 `error.code` 按下表取值；`error.data` 里写明错误分类�
 | `editDraft`（v12） | 块数同发送 |
 | 操作（v13） | 至多 16 项；`label` 与提醒按钮的文字至多 20 字（多出的项、太长的不登记） |
 | 步骤（v13） | `showText.text` 至多 4096 字；列表至多 200 行、每行至多 4 颗按钮；`links` 至多 8 个；`sections` 至多 16 段；其余每段文字至多 200 字（超出的一步不显示、这次流程失败） |
+| `account/avatar` 交出的头像（v35，宿主自己守） | 边长 256 以内、256 KiB 以内，只用 PNG 或 JPEG |
 
 宿主还会核对这几件事：
 - 结果里的会话编号和请求的一致。
@@ -739,6 +747,7 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 10. v12 的新声明（没声明的跳过）：`userAdjustable`、`editsByContent` 的取值宿主认得出；`retranslateRules` 名字不重复；`emoji.textPattern` 能编译、有一个括号；`logoInk` 是合法的外框；`loginMethods` 的类型认得出、编号不重复、不超过 8 种，`callbackPath` 在这个 IM 自己的 `/hhh-friend-im/<平台编号>/` 下面；声明了 `conversations.recentActivity` 就要能回合法结果，声明了 `session.renew` 就要能答。
 11. v13 的新声明（没声明的跳过）：`actions` 的位置认得出、编号合规不重复、文字不超长、不超过 16 项；声明了账号级操作、登录着时 `actions/start` 要回流程编号；声明了 `host` 登录方式时提示只有宿主允许的（带官方签名的）程序能用。
 12. v15：声明了 `people.get` 时，问一个不存在的编号（声明了 `people.bots` 时人与机器人各一个），结果读得懂、同一个编号不会既在 `found` 又在 `missing`；`people.bots` 要先声明 `people.get`、`people.batchMax` 在 1–2000 之间（随能力组合一起查）。
+13. v35：声明了 `account.hostAvatar` 时交一张 1×1 的 PNG 样图，程序 10 秒内回成功；交头像会改本人头像、发给别人，算写操作，同发送一样需要 `--allow-send`（没给时跳过）。
 
 `--mock` 要求程序支持不联网的模拟模式（见实现范式 §9）；`--live --read-only` 用真实账号，只做读取。
 
@@ -766,6 +775,7 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 | `login/*`、`credential/save`、`session/expired` | Friend 的授权和凭据保存（`StoreGrantBackend`）；外部程序走一套通用流程 |
 | `conversations/recentActivity`（v12） | `ImClient::recent_activity`（会话发现） |
 | `session/notice`、`session/renew`、`login/callback`（v12） | Friend 的插件卡问题行、插件续期任务、本机回调路由 |
+| `account/avatar`（v35） | `ProviderProcess::host_avatar`；Friend 在插件上线与用户头像变化时交 |
 
 协议的线上类型和 hhh-im 的内部类型分开定义、分开冻结，由适配器在两边之间翻译。这样内部模型怎么改，都不会影响已经发布的程序。协议里没有连接编号，`connection_id` 和 `ActorRef.id_type` 由适配器补上。
 
@@ -820,3 +830,4 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 - 2026-10-12（契约 v15，可选的加法，主版本仍是 1）：能力 `people.bots` 与 `people/get` 的 `bots`（按编号读机器人与应用）、`people.batchMax`（一次读人的上限）；宿主照 `people/get` 的结果办——只把 `missing` 记成“没有”，两边都没有的下次再读（以前没返回的一律记“没有”）；提及所有人可带平台的叫法（`mention` 的 `name`，内容块与格式正文里都是）；会话发现的一项可带群与频道的资料（`conversation`）；协议包的插件运行时（`runtime` 部件）与格式正文、卡片的类型（`content` 模块）。
 - 2026-10-16（契约 v19，可选的加法，主版本仍是 1）：`action/finished` 的 `removeFromList`（会话级操作做完后让会话离开宿主的列表，等同取消关注；不认识它的旧宿主只关对话框）。
 - 2026-10-21（hhh-im client 契约 v37，主版本仍是 1）：声明了 `discovery`、没有 `conversations.recentActivity` 但能列会话与读消息的程序，由宿主逐会话限频发现会话（原先这种声明不生效）；程序不用新增方法。
+- 2026-10-22（契约 v35，可选的加法，主版本仍是 1）：能力 `account.hostAvatar` 与宿主→程序请求 `account/avatar {avatar}`（本机用户头像：PNG / JPEG、边长 256 与 256 KiB 以内，§6.8）；`hostAccount.avatarUrl` 宿主不再填；§14 新预算；§17 新检查（需要 `--allow-send`）。

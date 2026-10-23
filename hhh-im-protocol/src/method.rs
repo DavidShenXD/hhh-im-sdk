@@ -69,6 +69,8 @@ pub enum Method {
     SessionNotice,
     /// 用存着的凭据续期（宿主→插件，契约 provider-protocol v12 缺口 7）。
     SessionRenew,
+    /// 交本机用户头像（宿主→插件，契约 provider-protocol v35）。
+    AccountAvatar,
     // —— 读取（宿主→插件）——
     /// 列会话。
     ConversationsList,
@@ -168,6 +170,7 @@ impl Method {
             Method::SessionExpired => "session/expired",
             Method::SessionNotice => "session/notice",
             Method::SessionRenew => "session/renew",
+            Method::AccountAvatar => "account/avatar",
             Method::ConversationsList => "conversations/list",
             Method::ConversationsGet => "conversations/get",
             Method::ConversationsSearch => "conversations/search",
@@ -240,6 +243,7 @@ impl Method {
             Method::SessionExpired,
             Method::SessionNotice,
             Method::SessionRenew,
+            Method::AccountAvatar,
             Method::ConversationsList,
             Method::ConversationsGet,
             Method::ConversationsSearch,
@@ -1423,6 +1427,77 @@ pub struct SessionRenewParams {
     pub credential: String,
 }
 
+/// `account/avatar` 参数（宿主→插件，需要能力 `account.hostAvatar`，契约 provider-protocol v35）：本机用户现在的头像。
+///
+/// 会话上线后交一次，用户换头像、或用默认头像时改名字后再交；插件回空结果表示收到。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountAvatarParams {
+    /// 头像；`null` 表示这个用户没有任何头像可交。
+    #[serde(default)]
+    pub avatar: Option<HostAvatar>,
+}
+
+/// 宿主交给插件的一张头像：缩到 [`crate::budget::HOST_AVATAR_MAX_SIDE`] 以内、不超过
+/// [`crate::budget::HOST_AVATAR_MAX_BYTES`] 字节，只用 PNG 或 JPEG。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostAvatar {
+    /// `image/png` 或 `image/jpeg`。
+    pub mime: String,
+    /// 图片字节的 base64（标准字母表、带补齐）。
+    pub data: String,
+    /// 图片字节的 sha256（64 位小写十六进制），插件据此判断是不是同一张。
+    pub sha256: String,
+    /// 图片字节数。
+    pub size: u64,
+}
+
+impl std::fmt::Debug for HostAvatar {
+    // 不把整张图打进日志：只要类型、大小与摘要。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostAvatar")
+            .field("mime", &self.mime)
+            .field("size", &self.size)
+            .field("sha256", &self.sha256)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostAvatar {
+    /// 形状不对时的原因：类型不是 PNG / JPEG、超过上限、摘要不是 64 位小写十六进制、base64 长度与字节数对不上。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hhh_im_protocol::method::HostAvatar;
+    /// let ok = HostAvatar { mime: "image/png".into(), data: "AAEC".into(), sha256: "a".repeat(64), size: 3 };
+    /// assert_eq!(ok.problem(), None);
+    /// let gif = HostAvatar { mime: "image/gif".into(), ..ok.clone() };
+    /// assert!(gif.problem().is_some());
+    /// ```
+    pub fn problem(&self) -> Option<&'static str> {
+        if !matches!(self.mime.as_str(), "image/png" | "image/jpeg") {
+            return Some("头像只收 PNG 或 JPEG");
+        }
+        if self.size == 0 || self.size > crate::budget::HOST_AVATAR_MAX_BYTES as u64 {
+            return Some("头像字节数为零或超过上限");
+        }
+        if self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Some("头像摘要不是 64 位小写十六进制");
+        }
+        if self.data.len() as u64 != self.size.div_ceil(3) * 4 {
+            return Some("头像 base64 长度与字节数对不上");
+        }
+        None
+    }
+}
+
 /// `session/notice` 通知参数（插件→宿主）：这个连接现在有的问题，每次给全，空数组就是都没有了。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2116,10 +2191,59 @@ mod tests {
             (Method::SessionNotice, "session/notice"),
             (Method::SessionRenew, "session/renew"),
             (Method::LoginCallback, "login/callback"),
+            (Method::AccountAvatar, "account/avatar"),
         ] {
             assert_eq!(m.as_str(), name);
             assert_eq!(Method::from_name(name), Some(m));
         }
+    }
+
+    // 契约 provider-protocol v35：`account/avatar` 的参数原样往返；没有头像时是 null；形状不对的认得出；日志里不打整张图。
+    #[test]
+    fn v35_account_avatar_round_trips_and_checks_its_shape() {
+        use serde_json::json;
+        let wire = json!({ "avatar": { "mime": "image/png", "data": "iVBORw==", "sha256": "0".repeat(64), "size": 5 } });
+        let params: AccountAvatarParams = serde_json::from_value(wire.clone()).unwrap();
+        let avatar = params.avatar.clone().unwrap();
+        assert_eq!((avatar.mime.as_str(), avatar.size), ("image/png", 5));
+        assert_eq!(avatar.problem(), None);
+        assert_eq!(serde_json::to_value(&params).unwrap(), wire);
+        let none: AccountAvatarParams = serde_json::from_value(json!({ "avatar": null })).unwrap();
+        assert_eq!(none.avatar, None);
+        let missing: AccountAvatarParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(missing, none, "没写 avatar 与 null 一样");
+        let bad = [
+            HostAvatar {
+                mime: "image/webp".into(),
+                ..avatar.clone()
+            },
+            HostAvatar {
+                size: crate::budget::HOST_AVATAR_MAX_BYTES as u64 + 1,
+                ..avatar.clone()
+            },
+            HostAvatar {
+                size: 0,
+                data: String::new(),
+                ..avatar.clone()
+            },
+            HostAvatar {
+                sha256: "A".repeat(64),
+                ..avatar.clone()
+            },
+            HostAvatar {
+                sha256: "0".repeat(63),
+                ..avatar.clone()
+            },
+            HostAvatar {
+                data: "iVBORw==AAAA".into(),
+                ..avatar.clone()
+            },
+        ];
+        for one in bad {
+            assert!(one.problem().is_some(), "{one:?}");
+        }
+        let shown = format!("{avatar:?}");
+        assert!(!shown.contains("iVBORw"), "日志里不该有图片字节：{shown}");
     }
 
     // 契约 provider-protocol v12：登录、续期、交接相关的新字段都是可选的——旧插件、旧宿主的形状照读，写回不多出键。

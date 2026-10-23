@@ -402,6 +402,13 @@ async fn run(args: Args) -> i32 {
         (None, _) => report.skip("发送检查", "未给 --allow-send，跳过真实发送"),
     }
 
+    // 9b. 宿主头像（provider-protocol v35）：交头像会改本人在这家 IM 的头像、发给别人，算写操作，同发送一样要 --allow-send。
+    match (caps.account.host_avatar, &args.allow_send) {
+        (false, _) => report.skip("宿主头像能收", "没声明 account.hostAvatar"),
+        (true, None) => report.skip("宿主头像能收", "未给 --allow-send，跳过会改本人头像的检查"),
+        (true, Some(_)) => check_host_avatar(&conn, &mut report).await,
+    }
+
     // 10. ping 及时、shutdown 退出。
     match call_t(&conn, "ping", json!({}), Duration::from_secs(10)).await {
         Ok(_) => report.pass("ping 及时响应"),
@@ -755,6 +762,27 @@ async fn check_v12_calls(
     }
 }
 
+/// 自检交给插件的样图：1×1 的 PNG。
+fn host_avatar_sample() -> hhh_im_protocol::method::AccountAvatarParams {
+    hhh_im_protocol::method::AccountAvatarParams {
+        avatar: Some(hhh_im_protocol::method::HostAvatar {
+            mime: "image/png".into(),
+            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGMor6z4DwAFOwJoUO6VrQAAAABJRU5ErkJggg==".into(),
+            sha256: "1523d93314347302031d1b73aa7e78d3524608d2664f8f8e732b26e6392e51fc".into(),
+            size: 70,
+        }),
+    }
+}
+
+/// 交一张样图（`account/avatar`），插件 10 秒内回成功才算能收。
+async fn check_host_avatar(conn: &Arc<Connection>, report: &mut Report) {
+    let params = serde_json::to_value(host_avatar_sample()).expect("样图参数总能写成 JSON");
+    match call_t(conn, "account/avatar", params, Duration::from_secs(10)).await {
+        Ok(_) => report.pass("宿主头像能收"),
+        Err(e) => report.fail("宿主头像能收", e),
+    }
+}
+
 fn check_pushed_messages(report: &mut Report, events: &[Value]) {
     let mut saw_message = false;
     let mut ms_ok = true;
@@ -1104,6 +1132,14 @@ fn base64_len(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::base64_len;
+
+    // 自检交的样图本身合规（类型、大小、摘要、base64 长度对得上），插件不会因样图不合规而回错。
+    #[test]
+    fn the_host_avatar_sample_is_well_formed() {
+        let sample = super::host_avatar_sample().avatar.unwrap();
+        assert_eq!(sample.problem(), None);
+        assert_eq!(base64_len(&sample.data), sample.size as usize);
+    }
 
     #[test]
     fn base64_len_counts_decoded_bytes() {
