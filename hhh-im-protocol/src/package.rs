@@ -212,7 +212,42 @@ pub struct Packed {
 /// 打 Windows 包时清单的 `command` 没写扩展名、文件夹里有 `<command>.exe`，包里的清单写成带 `.exe` 的：同一份清单能打
 /// 各系统的包（宿主按清单路径直接启动程序，Windows 上要带扩展名）。打 iPhone / iPad 的 WASM 包时同理找 `<command>.wasm`，
 /// 而且程序必须是 WASM 文件（契约 provider-protocol v18）。
+///
+/// 清单里写的 `minHost` 原样带进包；要按插件编进去的 IM SDK 抬高它时用 [`pack_with`]。
 pub fn pack(dir: &Path, target: Target, out: &Path) -> Result<Packed, PackageError> {
+    pack_with(dir, target, out, &PackOptions::default())
+}
+
+/// 打包时的额外要求。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackOptions {
+    /// 宿主至少要有的 IM SDK 版本：包里清单的 `minHost` 取它与清单原来写的两者中较高的（打包工具按插件锁定的 SDK
+    /// 给，见 [`crate::release::Version::sdk_floor`]）。
+    pub min_host: Option<crate::release::Version>,
+}
+
+/// 同 [`pack`]，另按 `options` 改写包里的清单。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::package::{PackOptions, pack_with, read_manifest};
+/// use hhh_im_protocol::release::{Target, Version};
+/// let temp = tempfile::tempdir().unwrap();
+/// let dir = temp.path();
+/// std::fs::write(dir.join("hhh-im-provider.json"), r#"{"manifestVersion":1,"id":"demo-im","name":"演示","version":"0.1.0","command":"demo","os":["linux"],"minHost":"0.3.0"}"#).unwrap();
+/// std::fs::write(dir.join("demo"), b"program").unwrap();
+/// let options = PackOptions { min_host: Some(Version(0, 9, 0)) };
+/// let packed = pack_with(dir, Target::LinuxX64, &dir.join("dist"), &options).unwrap();
+/// let manifest = read_manifest(std::fs::File::open(&packed.path).unwrap()).unwrap();
+/// assert_eq!(manifest.min_host.as_deref(), Some("0.9.0"));
+/// ```
+pub fn pack_with(
+    dir: &Path,
+    target: Target,
+    out: &Path,
+    options: &PackOptions,
+) -> Result<Packed, PackageError> {
     let manifest_path = dir.join(crate::MANIFEST_FILE);
     let text = std::fs::read_to_string(&manifest_path).map_err(|error| {
         PackageError(format!("读不到清单 {}：{error}", manifest_path.display()))
@@ -254,6 +289,16 @@ pub fn pack(dir: &Path, target: Target, out: &Path) -> Result<Packed, PackageErr
         }
     }
     manifest.release_fields_ok().map_err(PackageError)?;
+    if let Some(required) = options.min_host {
+        // 清单原来写的更高就照旧（作者另有更高要求）；写法不对的在上面 release_fields_ok 里已经拦下。
+        let written = manifest
+            .min_host
+            .as_deref()
+            .and_then(crate::release::Version::parse);
+        if written.is_none_or(|written| written < required) {
+            manifest.min_host = Some(required.to_string());
+        }
+    }
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|error| PackageError(format!("清单写不出：{error}")))?;
     std::fs::create_dir_all(out)

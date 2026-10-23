@@ -3,15 +3,18 @@
 //!
 //! 用法：
 //! ```text
-//! hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--sign-key <私钥文件>] [--publish [--latest-only]]
+//! hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--sdk <版本>] [--sign-key <私钥文件>] [--publish [--latest-only]]
 //! hhh-im-pack keygen <放钥匙的文件夹>
 //! ```
+//! 包里清单与版本索引的 `minHost` 自动写成插件需要的最低 IM SDK（插件锁定的 `hhh-im-protocol` 的“主.次.0”）：从插件
+//! 文件夹往上找第一个 `Cargo.lock` 读出来；清单原来写得更高就照旧。宿主的 IM SDK 低于它就写“需要先更新 HHH”。
 //! - `--target`：`windows-x64`、`macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64`，iPhone / iPad 用 `wasm32-wasip2`；
 //!   不写用这台电脑的目标。
 //! - `--out`：包与索引放哪，默认插件文件夹下的 `dist/`。
 //! - `--notes`：更新说明（Markdown 文件）；不写时沿用输出文件夹里同一版本索引已有的说明。
 //! - `--tag`：发布用的标签，必须是 `v<清单版本>`，不一致就不打。
 //! - `--after`：上一个发布的版本；新版本必须比它大。
+//! - `--sdk`：插件用的 IM SDK 版本（`主.次.修订`）；不是 Rust 写的插件、找不到 `Cargo.lock` 时用它写明。
 //! - `--publish`：打好后发到清单 `source` 写的 GitHub / GitLab 仓库（见 [`publish`]）：标签默认 `v<清单版本>`，新版本要比
 //!   仓库里最新的正式版本大，仓库里同一版本已有的索引先合进来；令牌只从环境变量读（`HHH_IM_PUBLISH_TOKEN`，或
 //!   `GITHUB_TOKEN` / `GITLAB_TOKEN`）。
@@ -42,13 +45,71 @@ struct Args {
     notes: Option<PathBuf>,
     tag: Option<String>,
     after: Option<String>,
+    sdk: Option<Version>,
     sign_key: Option<PathBuf>,
     publish: bool,
     latest_only: bool,
 }
 
 fn usage() -> String {
-    "用法：hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--sign-key <私钥文件>] [--publish [--latest-only]]\n      hhh-im-pack keygen <放钥匙的文件夹>".into()
+    "用法：hhh-im-pack <插件文件夹> [--target <目标>] [--out <输出文件夹>] [--notes <说明.md>] [--tag <标签>] [--after <上一个版本>] [--sdk <版本>] [--sign-key <私钥文件>] [--publish [--latest-only]]\n      hhh-im-pack keygen <放钥匙的文件夹>".into()
+}
+
+/// 插件锁定的 IM SDK 在 `Cargo.lock` 里的包名。
+const SDK_PACKAGE: &str = "hhh-im-protocol";
+
+/// 插件编进去的 IM SDK 版本：从插件文件夹往上找第一个 `Cargo.lock`（cargo 编插件用的就是它），读里面
+/// `hhh-im-protocol` 的版本。返回版本与锁文件路径；找不到锁文件、锁文件里没有这个包时给原因。
+fn locked_sdk(dir: &Path) -> Result<(Version, PathBuf), String> {
+    let start = std::fs::canonicalize(dir)
+        .map_err(|error| format!("插件文件夹 {} 读不了：{error}", dir.display()))?;
+    // 往上找到仓库根（有 .git 的那一层）为止：插件仓库的锁文件在根上；不越过它读到外面别的项目的锁文件。
+    let lock = start
+        .ancestors()
+        .scan(false, |past_root, folder| {
+            if *past_root {
+                return None;
+            }
+            *past_root = folder.join(".git").exists();
+            Some(folder.join("Cargo.lock"))
+        })
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            format!(
+                "在 {} 和它上面的文件夹里（到仓库根为止）找不到 Cargo.lock，读不出插件用的 IM SDK 版本：在插件仓库里打包，或用 --sdk <版本> 写明。",
+                start.display()
+            )
+        })?;
+    let text = std::fs::read_to_string(&lock)
+        .map_err(|error| format!("{} 读不了：{error}", lock.display()))?;
+    match sdk_in_lock(&text) {
+        Some(version) => Ok((version, lock)),
+        None => Err(format!(
+            "{} 里没有 {SDK_PACKAGE}，读不出插件用的 IM SDK 版本：用 --sdk <版本> 写明。",
+            lock.display()
+        )),
+    }
+}
+
+/// 从 `Cargo.lock` 正文里读 `hhh-im-protocol` 的版本；锁了几个版本时取最高的。
+fn sdk_in_lock(text: &str) -> Option<Version> {
+    // Cargo.lock 一个包一段：`[[package]]` 开头，下面是 `name = "…"`、`version = "…"`；文件开头的 `version = 4`
+    // 是锁文件格式的版本，那时还没进任何一段，不算。
+    let mut best = None;
+    let mut name: Option<&str> = None;
+    for line in text.lines().map(str::trim) {
+        if line == "[[package]]" {
+            name = None;
+        } else if let Some(value) = line.strip_prefix("name = ") {
+            name = Some(value.trim_matches('"'));
+        } else if let Some(value) = line.strip_prefix("version = ")
+            && name == Some(SDK_PACKAGE)
+            && let Some(version) = Version::parse(value.trim_matches('"'))
+        {
+            best = best.max(Some(version));
+        }
+    }
+    best
 }
 
 fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -58,6 +119,7 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut notes = None;
     let mut tag = None;
     let mut after = None;
+    let mut sdk = None;
     let mut sign_key = None;
     let mut publish = false;
     let mut latest_only = false;
@@ -76,6 +138,13 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             "--notes" => notes = Some(PathBuf::from(value("--notes")?)),
             "--tag" => tag = Some(value("--tag")?),
             "--after" => after = Some(value("--after")?),
+            "--sdk" => {
+                let text = value("--sdk")?;
+                sdk = Some(
+                    Version::parse(&text)
+                        .ok_or_else(|| format!("--sdk 要写 主.次.修订（现在是 {text}）。"))?,
+                );
+            }
             "--sign-key" => sign_key = Some(PathBuf::from(value("--sign-key")?)),
             "--publish" => publish = true,
             "--latest-only" => latest_only = true,
@@ -109,6 +178,7 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         notes,
         tag,
         after,
+        sdk,
         sign_key,
         publish,
         latest_only,
@@ -171,7 +241,19 @@ fn run(args: Args) -> Result<String, String> {
     }
     // 私钥先读：读不了就不打包、不发布（别发出一个没签名的官方版本）。
     let signing = args.sign_key.as_deref().map(sign::load).transpose()?;
-    let packed = package::pack(&args.dir, args.target, &args.out).map_err(|error| error.0)?;
+    // 插件用的 IM SDK 先读：读不出就不打包（发出去的版本一定写着宿主要多新的 IM SDK）。
+    let (sdk, sdk_from) = match args.sdk {
+        Some(sdk) => (sdk, "--sdk".to_owned()),
+        None => {
+            let (sdk, lock) = locked_sdk(&args.dir)?;
+            (sdk, lock.display().to_string())
+        }
+    };
+    let options = package::PackOptions {
+        min_host: Some(sdk.sdk_floor()),
+    };
+    let packed =
+        package::pack_with(&args.dir, args.target, &args.out, &options).map_err(|error| error.0)?;
     let manifest = &packed.manifest;
     let version = Version::parse(&manifest.version).ok_or("清单版本号不是 主.次.修订。")?;
     if let Some(tag) = &args.tag
@@ -247,6 +329,17 @@ fn run(args: Args) -> Result<String, String> {
     if notes.chars().count() > NOTES_MAX_CHARS {
         return Err(format!("更新说明超过 {NOTES_MAX_CHARS} 字。"));
     }
+    // 同一版本几台电脑各打各的目标：索引里的 minHost 取已有的与这次的较高的，哪个目标的包都不会少要求。
+    let min_host = [
+        existing
+            .as_ref()
+            .and_then(|index| index.min_host.as_deref()),
+        manifest.min_host.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Version::parse)
+    .max();
     let mut packages: Vec<ReleasePackage> =
         existing.map(|index| index.packages).unwrap_or_default();
     packages.retain(|package| package.target != args.target);
@@ -268,7 +361,7 @@ fn run(args: Args) -> Result<String, String> {
             .as_deref()
             .and_then(|logo| logo_data_url(&args.dir, logo)),
         version: manifest.version.clone(),
-        min_host: manifest.min_host.clone(),
+        min_host: min_host.map(|version| version.to_string()),
         notes,
         packages,
     };
@@ -297,6 +390,10 @@ fn run(args: Args) -> Result<String, String> {
         index.version,
         index.packages.len()
     );
+    summary.push_str(&format!(
+        "\n需要的 IM SDK：{} 或更新（插件用 {sdk}，读自 {sdk_from}）",
+        index.min_host.as_deref().unwrap_or("-")
+    ));
     if signing.is_some() {
         summary.push_str(&format!("\n已签名 {}", signature_path.display()));
     }
@@ -364,7 +461,108 @@ mod tests {
             b"<svg xmlns='http://www.w3.org/2000/svg'/>",
         )
         .unwrap();
+        std::fs::write(dir.join("Cargo.lock"), LOCK).unwrap();
         Dir(dir)
+    }
+
+    /// 插件仓库的锁文件：锁了 IM SDK 0.9.3（从公开仓库按标签取），另有别的包。
+    const LOCK: &str = "# This file is automatically @generated by Cargo.\nversion = 4\n\n[[package]]\nname = \"demo-im\"\nversion = \"0.3.0\"\n\n[[package]]\nname = \"hhh-im-protocol\"\nversion = \"0.9.3\"\nsource = \"git+https://github.com/MagicLizi/hhh-im-sdk?tag=v0.9.3#abc\"\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n";
+
+    fn index_of(dir: &Path) -> ReleaseIndex {
+        serde_json::from_str(
+            &std::fs::read_to_string(dir.join("dist").join(RELEASE_INDEX_FILE)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn packed_manifest(dir: &Path, file: &str) -> hhh_im_protocol::Manifest {
+        package::read_manifest(std::fs::File::open(dir.join("dist").join(file)).unwrap()).unwrap()
+    }
+
+    // 契约 friend/im-update-hint v1 §兼容闸门：minHost 自动写成插件锁定的 IM SDK 的“主.次.0”，包里清单与版本索引一样；
+    // 作者另写得更高的照旧。
+    #[test]
+    fn the_locked_sdk_becomes_the_min_host_of_package_and_index() {
+        let dir = plugin("sdk");
+        let summary = run(args(&dir.0, &["--target", "windows-x64"])).unwrap();
+        assert!(
+            summary.contains("需要的 IM SDK：0.9.0 或更新（插件用 0.9.3"),
+            "{summary}"
+        );
+        assert_eq!(index_of(&dir.0).min_host.as_deref(), Some("0.9.0"));
+        assert_eq!(
+            packed_manifest(&dir.0, "demo-im-0.3.0-windows-x64.hhhim")
+                .min_host
+                .as_deref(),
+            Some("0.9.0")
+        );
+
+        let higher = std::fs::read_to_string(dir.0.join(hhh_im_protocol::MANIFEST_FILE))
+            .unwrap()
+            .replace("\"minHost\":\"0.1.0\"", "\"minHost\":\"1.2.0\"");
+        std::fs::write(dir.0.join(hhh_im_protocol::MANIFEST_FILE), higher).unwrap();
+        run(args(&dir.0, &["--target", "linux-x64"])).unwrap();
+        assert_eq!(index_of(&dir.0).min_host.as_deref(), Some("1.2.0"));
+        assert_eq!(
+            packed_manifest(&dir.0, "demo-im-0.3.0-linux-x64.hhhim")
+                .min_host
+                .as_deref(),
+            Some("1.2.0")
+        );
+    }
+
+    // 读不出插件用的 IM SDK 就不打包（发出去的版本一定写着要求）；不是 Rust 写的插件用 --sdk 写明。
+    #[test]
+    fn without_a_lock_the_pack_is_refused_unless_the_sdk_is_given() {
+        // 外面那层有锁文件（别的项目），里面的插件仓库（有 .git）没有：不越过仓库根去读外面的。
+        let outer = plugin("nolock");
+        let repo = outer.0.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        for file in [hhh_im_protocol::MANIFEST_FILE, "demo", "logo.svg"] {
+            std::fs::copy(outer.0.join(file), repo.join(file)).unwrap();
+        }
+        let error = run(args(&repo, &["--target", "windows-x64"])).unwrap_err();
+        assert!(
+            error.contains("Cargo.lock") && error.contains("--sdk"),
+            "{error}"
+        );
+        assert!(
+            !repo.join("dist/demo-im-0.3.0-windows-x64.hhhim").exists(),
+            "读不出要求时不留包"
+        );
+
+        run(args(&repo, &["--target", "windows-x64", "--sdk", "0.8.1"])).unwrap();
+        assert_eq!(index_of(&repo).min_host.as_deref(), Some("0.8.0"));
+        assert!(parse_args(["x".into(), "--sdk".into(), "0.8".into()].into_iter()).is_err());
+    }
+
+    // 锁文件里有几个版本取最高的；开头那行锁文件格式的 version 不算；锁里没有 IM SDK 的给原因。
+    #[test]
+    fn the_highest_locked_sdk_is_read_and_a_lock_without_it_is_explained() {
+        let two = "version = 4\n\n[[package]]\nname = \"hhh-im-protocol\"\nversion = \"0.7.0\"\n\n[[package]]\nname = \"hhh-im-protocol\"\nversion = \"0.10.2\"\n";
+        assert_eq!(sdk_in_lock(two), Some(Version(0, 10, 2)));
+        assert_eq!(
+            sdk_in_lock("version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n"),
+            None
+        );
+
+        let dir = plugin("othercrate");
+        std::fs::write(
+            dir.0.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let error = locked_sdk(&dir.0).unwrap_err();
+        assert!(
+            error.contains(SDK_PACKAGE) && error.contains("--sdk"),
+            "{error}"
+        );
+
+        // 包放在插件仓库里的子文件夹（模板打包时是 dist/stage）：往上找到仓库根的锁文件。
+        let stage = dir.0.join("dist").join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(dir.0.join("Cargo.lock"), LOCK).unwrap();
+        assert_eq!(locked_sdk(&stage).unwrap().0, Version(0, 9, 3));
     }
 
     fn args(dir: &Path, extra: &[&str]) -> Args {
@@ -464,7 +662,7 @@ mod tests {
                 index.publisher.as_deref(),
                 index.min_host.as_deref()
             ),
-            (Some("演示"), Some("me"), Some("0.1.0"))
+            (Some("演示"), Some("me"), Some("0.9.0"))
         );
         assert!(
             index

@@ -350,6 +350,13 @@ pub struct Reaction {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
+    /// 伙伴代发来源的显示快照；无效的附注不影响正文与同批消息。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::attribution::receive"
+    )]
+    pub agent_attribution: Option<Box<crate::AgentAttribution>>,
     /// 平台消息编号。
     pub id: String,
     /// 所属会话。
@@ -502,6 +509,13 @@ pub struct Emoji {
     /// 肤色版本：它是哪个表情的哪种肤色（v14）；面板按它把肤色版本收到原表情下面。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tone_of: Option<ToneOf>,
+    /// 能不能按平台说明的 `emoji.textTemplate` 写进文字（v31）：假时输入框的表情面板不列它。与 [`Self::panel`]
+    /// （能不能点成回应）互相独立。不写为真。
+    #[serde(
+        default = "crate::types::yes",
+        skip_serializing_if = "crate::types::is_yes"
+    )]
+    pub in_text: bool,
 }
 
 /// 肤色版本对应的原表情与肤色。
@@ -528,6 +542,10 @@ pub(crate) fn yes() -> bool {
     true
 }
 
+pub(crate) fn is_yes(value: &bool) -> bool {
+    *value
+}
+
 /// 表情分类。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -536,7 +554,23 @@ pub struct EmojiCategory {
     pub id: String,
     /// 名字。
     pub name: String,
+    /// 分类标签画哪个图标（v31），取 [`EMOJI_CATEGORY_ICONS`] 之一；不写或不认识时宿主画圆。分类编号本身不决定图标。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
+
+/// 宿主图标库里分类标签能用的图标（v31）：笑脸、自然、食物、出行、活动、物品、符号、旗帜、自定义。
+pub const EMOJI_CATEGORY_ICONS: [&str; 9] = [
+    "smileys",
+    "nature",
+    "food",
+    "travel",
+    "activities",
+    "objects",
+    "symbols",
+    "flags",
+    "custom",
+];
 
 /// 推送事件（protocol-v1 §11.2），`type` 分辨。宿主遇到不认识的事件记日志、跳过、仍确认整批。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -603,6 +637,35 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
 
+    // 契约 provider-protocol v31：表情能不能写进文字、分类图标都可选；不写时 inText 读成真、写回不多出键。
+    #[test]
+    fn v31_in_text_defaults_to_true_and_category_icons_are_optional() {
+        use super::{Emoji, EmojiCategory};
+        let old = serde_json::json!({ "emojiType": "OK", "name": "OK", "panel": true });
+        let emoji: Emoji = serde_json::from_value(old.clone()).unwrap();
+        assert!(emoji.in_text);
+        assert_eq!(
+            serde_json::to_value(&emoji).unwrap(),
+            old,
+            "旧形状写回不多出键"
+        );
+        let only_reaction = serde_json::json!({ "emojiType": "2021", "name": "2021年", "panel": true, "inText": false });
+        let emoji: Emoji = serde_json::from_value(only_reaction.clone()).unwrap();
+        assert!(
+            emoji.panel && !emoji.in_text,
+            "能点成回应、不能写进文字，两个标记互相独立"
+        );
+        assert_eq!(serde_json::to_value(&emoji).unwrap(), only_reaction);
+
+        let plain: EmojiCategory =
+            serde_json::from_value(serde_json::json!({ "id": "people", "name": "人物" })).unwrap();
+        assert!(plain.icon.is_none());
+        let with_icon = serde_json::json!({ "id": "people", "name": "人物", "icon": "smileys" });
+        let category: EmojiCategory = serde_json::from_value(with_icon.clone()).unwrap();
+        assert_eq!(category.icon.as_deref(), Some("smileys"));
+        assert_eq!(serde_json::to_value(&category).unwrap(), with_icon);
+    }
+
     // 契约 provider-protocol v14：账号与提及可带编号种类，提及还可带人还是机器人；不写时写回不多出键。
     #[test]
     fn v14_identities_carry_an_optional_id_type_and_mentions_a_kind() {
@@ -645,6 +708,7 @@ mod tests {
     #[test]
     fn a_message_omits_empty_optionals() {
         let m = Message {
+            agent_attribution: None,
             id: "m1".into(),
             conversation_id: "c1".into(),
             sender: Sender {
@@ -677,6 +741,7 @@ mod tests {
     fn send_outcome_is_tagged_by_state() {
         let acc = SendOutcome::Accepted {
             message: Box::new(Message {
+                agent_attribution: None,
                 id: "m".into(),
                 conversation_id: "c".into(),
                 sender: Sender {

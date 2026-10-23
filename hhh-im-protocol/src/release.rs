@@ -203,6 +203,47 @@ impl Version {
         let version = Version(next()?, next()?, next()?);
         parts.next().is_none().then_some(version)
     }
+
+    /// 用这个版本的 IM SDK 编出来的插件，宿主至少要有的 IM SDK 版本：“主.次.0”。
+    ///
+    /// 修订号只修错、不加能力，所以只差修订号的宿主照样能跑；次版本号带来新能力，宿主低了就可能缺。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hhh_im_protocol::release::Version;
+    /// assert_eq!(Version(0, 9, 3).sdk_floor(), Version(0, 9, 0));
+    /// assert!(Version(0, 9, 1) >= Version(0, 9, 3).sdk_floor());
+    /// assert!(Version(0, 8, 9) < Version(0, 9, 0).sdk_floor());
+    /// ```
+    pub fn sdk_floor(self) -> Version {
+        Version(self.0, self.1, 0)
+    }
+
+    /// 这个库自己的版本（[`crate::SDK_VERSION`]）。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hhh_im_protocol::release::Version;
+    /// assert_eq!(Version::sdk().to_string(), hhh_im_protocol::SDK_VERSION);
+    /// ```
+    pub fn sdk() -> Version {
+        // 版本号来自本包的 Cargo.toml，编译时就定了；Cargo 要求它是 主.次.修订，这里读不出说明本包自己坏了。
+        Version::parse(crate::SDK_VERSION).expect("本包的版本号总是 主.次.修订")
+    }
+
+    /// 只写“主.次”（给人看的 IM SDK 版本，如“0.9”）。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hhh_im_protocol::release::Version;
+    /// assert_eq!(Version(0, 9, 3).minor_text(), "0.9");
+    /// ```
+    pub fn minor_text(self) -> String {
+        format!("{}.{}", self.0, self.1)
+    }
 }
 
 impl std::fmt::Display for Version {
@@ -463,7 +504,8 @@ pub struct ReleaseIndex {
     pub logo: Option<String>,
     /// 这个版本（同清单 `version`）。
     pub version: String,
-    /// 需要的最低宿主版本。
+    /// 宿主需要的最低 IM SDK 版本（`主.次.修订`，见 [`crate::SDK_VERSION`]）：打包工具按插件编进去的 SDK 自动写，
+    /// 宿主的 SDK 低于它就不给更新、写“需要先更新 HHH”。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_host: Option<String>,
     /// 更新说明（Markdown，给用户看）。

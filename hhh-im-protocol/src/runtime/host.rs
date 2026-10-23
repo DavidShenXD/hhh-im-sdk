@@ -43,6 +43,8 @@ struct Inner {
     /// 插件发出的请求的编号：字符串 `p1`、`p2`…，不会和宿主的数字编号撞号（rpc 模块的约定）。
     next: AtomicU64,
     waiting: Mutex<HashMap<String, oneshot::Sender<Result<Value, RpcError>>>>,
+    /// 性能自报（契约 provider-protocol v32）：宿主剖析开着时记。
+    perf: Arc<super::perf::Recorder>,
 }
 
 /// 宿主那一头：回请求、发通知、发请求并等回复。可以随意复制，复制出来的是同一个。
@@ -81,9 +83,15 @@ impl Host {
                 out,
                 next: AtomicU64::new(1),
                 waiting: Mutex::new(HashMap::new()),
+                perf: Arc::default(),
             })),
             Writes(rx),
         )
+    }
+
+    /// 这个插件进程的性能自报记录器。
+    pub(super) fn perf(&self) -> &Arc<super::perf::Recorder> {
+        &self.0.perf
     }
 
     fn send(&self, message: RpcMessage) {

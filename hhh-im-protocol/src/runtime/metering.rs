@@ -46,7 +46,11 @@ pub async fn read_request() -> Result<(), RpcError> {
             .ok_or_else(|| {
                 RpcError::from_kind(ErrorKind::ProtocolError, "宿主的读取额度凭据无效。")
             })?;
-        let granted = host.request_read_permit(permit).await?;
+        let asked = std::time::Instant::now();
+        let granted = host.request_read_permit(permit).await;
+        // 剖析开着时记下等宿主放行等了多久（限流，契约 provider-protocol v32 §4）。
+        super::perf::time_current(super::perf::PERMIT_WAIT, asked, asked.elapsed());
+        let granted = granted?;
         if granted.get("granted").and_then(Value::as_bool) != Some(true) {
             return Err(RpcError::from_kind(
                 ErrorKind::ProtocolError,

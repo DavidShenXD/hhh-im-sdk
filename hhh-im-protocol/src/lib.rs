@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attribution;
 pub mod content;
 pub mod method;
 pub mod platform;
@@ -32,6 +33,7 @@ pub mod package;
 #[cfg(feature = "runtime")]
 pub mod runtime;
 
+pub use attribution::AgentAttribution;
 pub use method::Method;
 pub use platform::{Capabilities, Manifest, PlatformDesc, SettingDecl};
 pub use rpc::{ErrorKind, RpcError, RpcErrorData, RpcId, RpcMessage, codec};
@@ -43,6 +45,19 @@ pub use types::{
 /// 本库实现的协议主版本号。只有不兼容的改动才升主版本。
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// 本库（IM SDK）的版本：编进宿主与插件程序。
+///
+/// 插件清单与版本索引的 `minHost` 写的是插件需要的最低 IM SDK 版本，宿主拿自己的这个版本跟它比
+/// （见 [`release::Version::sdk_floor`]）。这个版本号只在发布 SDK 时升。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::release::Version;
+/// assert!(Version::parse(hhh_im_protocol::SDK_VERSION).is_some());
+/// ```
+pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// 清单文件固定文件名。
 pub const MANIFEST_FILE: &str = "hhh-im-provider.json";
 
@@ -51,6 +66,10 @@ pub const ENV_FLAG: &str = "HHH_IM_PROTOCOL";
 
 /// 宿主强制执行的预算（protocol-v1 §14）。超出的内容宿主按协议错误处理，不写进本地库。
 pub mod budget {
+    /// 伙伴署名名字的 UTF-8 字节预算。
+    pub const AGENT_NAME_MAX_BYTES: usize = 512;
+    /// 伙伴静态缩略头像的完整 data URL 预算；不随每条消息携带大图。
+    pub const AGENT_AVATAR_MAX_BYTES: usize = 24 * 1024;
     /// 单条 JSON-RPC 消息最大字节数。
     pub const MESSAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
     /// 每批推送事件最多几个。
@@ -103,6 +122,8 @@ pub mod budget {
     pub const RETRANSLATE_RULES_MAX: usize = 32;
     /// 平台说明里的正则（表情写法）最长多少字节。
     pub const PATTERN_MAX_BYTES: usize = 1024;
+    /// 表情写进文字的写法（`emoji.textTemplate`，v31）去掉占位后最多几个字符。
+    pub const TEXT_TEMPLATE_AFFIX_MAX_CHARS: usize = 16;
     /// 一个插件最多声明几项操作（契约 provider-protocol v13）；多出的不登记。
     pub const ACTIONS_MAX: usize = 16;
     /// 操作、提醒按钮的文字最多几个字（按字符数）。
@@ -123,4 +144,14 @@ pub mod budget {
     pub const PEOPLE_GET_DEFAULT: usize = 100;
     /// `people.batchMax` 的上限（v15）。
     pub const PEOPLE_GET_MAX: usize = 2000;
+    /// 一条 `perf/report` 最多多少字节（契约 provider-protocol v32）：每秒一条，宿主内存与解析都可控。
+    pub const PERF_REPORT_BYTES_MAX: usize = 64 * 1024;
+    /// 一条 `perf/report` 最多几个区间：只报最慢与超过阈值的，其余进分布。
+    pub const PERF_SPANS_MAX: usize = 256;
+    /// 一条 `perf/report` 的计数与分布合计最多几个序列。
+    pub const PERF_SERIES_MAX: usize = 128;
+    /// `perf/report` 里的名字最多几个字（按字符数）：名字是方法名或固定标签，不是原文。
+    pub const PERF_NAME_CHARS_MAX: usize = 128;
+    /// `perf/start` 的报告间隔至少多少毫秒：防止插件刷屏。
+    pub const PERF_INTERVAL_MIN_MS: u64 = 500;
 }

@@ -56,6 +56,9 @@ pub enum Method {
     ActionFailed,
     /// 用户在一步里做了选择（宿主→插件通知；登录与操作共用）。
     StepChoose,
+    // —— 宿主公开资料（插件→宿主）——
+    /// 请求当前用户已保存的显示名；不提供令牌或其他资料。
+    HostUserName,
     // —— 凭据与授权（插件→宿主）——
     /// 保存凭据（插件→宿主）。
     CredentialSave,
@@ -136,6 +139,13 @@ pub enum Method {
     Status,
     /// 结构化日志（通知）。
     LogWrite,
+    // —— 性能自报（契约 provider-protocol v32；只对声明了 `perf` 的插件）——
+    /// 剖析开启：开始按间隔自报（宿主→插件请求）。
+    PerfStart,
+    /// 剖析关闭：停止自报（宿主→插件请求）。
+    PerfStop,
+    /// 一个间隔的自报（插件→宿主通知）。
+    PerfReport,
     // —— 取消（宿主→插件通知）——
     /// 取消请求。
     Cancel,
@@ -164,6 +174,7 @@ impl Method {
             Method::ActionFinished => "action/finished",
             Method::ActionFailed => "action/failed",
             Method::StepChoose => "step/choose",
+            Method::HostUserName => "host/userName",
             Method::CredentialSave => "credential/save",
             Method::RequestsAcquire => "requests/acquire",
             Method::RequestsReceived => "requests/received",
@@ -201,6 +212,9 @@ impl Method {
             Method::EventsPush => "events/push",
             Method::Status => "status",
             Method::LogWrite => "log/write",
+            Method::PerfStart => "perf/start",
+            Method::PerfStop => "perf/stop",
+            Method::PerfReport => "perf/report",
             Method::Cancel => "$/cancel",
         }
     }
@@ -237,6 +251,7 @@ impl Method {
             Method::ActionFinished,
             Method::ActionFailed,
             Method::StepChoose,
+            Method::HostUserName,
             Method::CredentialSave,
             Method::RequestsAcquire,
             Method::RequestsReceived,
@@ -274,6 +289,9 @@ impl Method {
             Method::EventsPush,
             Method::Status,
             Method::LogWrite,
+            Method::PerfStart,
+            Method::PerfStop,
+            Method::PerfReport,
             Method::Cancel,
         ];
         ALL.iter().copied().find(|m| m.as_str() == name)
@@ -305,6 +323,14 @@ pub struct HostInfo {
     pub name: String,
     /// 宿主版本。
     pub version: String,
+}
+
+/// `host/userName` 的结果。无当前名字时为空对象；旧宿主也可能回复空对象或方法不存在。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostUserNameResult {
+    /// 当前用户自己的已保存显示名；不是 IM 账号名或操作系统用户名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// 网络设置。
@@ -1856,6 +1882,9 @@ pub struct UploadsAbortParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessagesSendParams {
+    /// 伙伴代发来源；只向声明了 agentAttribution.send 的插件提供。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_attribution: Option<Box<crate::AgentAttribution>>,
     /// 操作编号（同一个只发一次）。
     pub operation_id: String,
     /// 发送目标。
@@ -2123,8 +2152,225 @@ pub struct CancelParams {
     pub id: crate::rpc::RpcId,
 }
 
+// ============================ 性能自报（契约 provider-protocol v32） ============================
+
+/// 自报分布的桶边界（毫秒）：第 i 个桶装 `(边界[i-1], 边界[i]]`，最后一个桶装超过最大边界的。由 SDK 固定，宿主按它还原。
+pub const PERF_HISTOGRAM_BOUNDS_MS: [f64; 12] = [
+    1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0,
+];
+
+/// `perf/start` 参数：剖析开启，插件开始按间隔自报。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerfStartParams {
+    /// 宿主的剖析会话编号；报告带回它，宿主丢掉别的会话的报告。
+    pub session: u64,
+    /// 报告间隔（毫秒），不小于 [`crate::budget::PERF_INTERVAL_MIN_MS`]。
+    pub interval_ms: u64,
+}
+
+/// `perf/stop` 参数：剖析关闭，插件停止自报。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerfStopParams {
+    /// 要停的会话编号。
+    pub session: u64,
+}
+
+/// 自报的一个区间。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerfSpan {
+    /// 方法名或插件声明的固定标签（不含编号、正文、令牌）。
+    pub name: String,
+    /// 开始时刻：相对本窗口起点（`fromMs`）的偏移，毫秒。
+    pub start_ms: f64,
+    /// 时长，毫秒。
+    pub dur_ms: f64,
+}
+
+/// 自报的一个计数（本窗口里的增量）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerfCounter {
+    /// 方法名或固定标签。
+    pub name: String,
+    /// 本窗口的增量。
+    pub value: u64,
+}
+
+/// 自报的一个分布（本窗口里同一名字的全部耗时）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerfHistogram {
+    /// 方法名或固定标签。
+    pub name: String,
+    /// 条数。
+    pub count: u64,
+    /// 合计毫秒。
+    pub sum_ms: f64,
+    /// 最长一条毫秒。
+    pub max_ms: f64,
+    /// 各桶条数，按 [`PERF_HISTOGRAM_BOUNDS_MS`]，比边界多一个（最后一个装超过最大边界的）。
+    pub buckets: Vec<u64>,
+}
+
+/// `perf/report` 通知参数：一个间隔里插件内部的耗时。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerfReportParams {
+    /// `perf/start` 给的会话编号。
+    pub session: u64,
+    /// 本会话里第几条（从 0 起）。
+    pub seq: u64,
+    /// 本窗口起点：插件自己的单调时钟（毫秒），宿主只用 `toMs - fromMs` 与区间偏移，不信绝对时刻。
+    pub from_ms: f64,
+    /// 本窗口终点。
+    pub to_ms: f64,
+    /// 区间（只报最慢与超过阈值的）。
+    #[serde(default)]
+    pub spans: Vec<PerfSpan>,
+    /// 计数。
+    #[serde(default)]
+    pub counters: Vec<PerfCounter>,
+    /// 分布。
+    #[serde(default)]
+    pub histograms: Vec<PerfHistogram>,
+}
+
+impl PerfReportParams {
+    /// 按 [`crate::budget`] 的自报上限核对（字节数由收到这一行的一方另核）；超出任何一项整条不收。
+    ///
+    /// # Errors
+    /// 返回超出的是哪一项。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hhh_im_protocol::method::{PerfCounter, PerfReportParams};
+    /// let mut report = PerfReportParams {
+    ///     session: 1, seq: 0, from_ms: 0.0, to_ms: 1000.0,
+    ///     spans: vec![], counters: vec![PerfCounter { name: "平台请求".into(), value: 3 }], histograms: vec![],
+    /// };
+    /// assert!(report.check().is_ok());
+    /// report.counters[0].name = "x".repeat(200);
+    /// assert!(report.check().is_err());
+    /// ```
+    pub fn check(&self) -> Result<(), &'static str> {
+        use crate::budget::{PERF_NAME_CHARS_MAX, PERF_SERIES_MAX, PERF_SPANS_MAX};
+        let name_ok = |name: &str| {
+            !name.is_empty()
+                && name.chars().count() <= PERF_NAME_CHARS_MAX
+                && !name.chars().any(char::is_control)
+        };
+        let time_ok = |ms: f64| ms.is_finite() && ms >= 0.0;
+        if !time_ok(self.from_ms) || !time_ok(self.to_ms) || self.to_ms < self.from_ms {
+            return Err("窗口起止时刻不对");
+        }
+        if self.spans.len() > PERF_SPANS_MAX {
+            return Err("区间太多");
+        }
+        if self.counters.len() + self.histograms.len() > PERF_SERIES_MAX {
+            return Err("计数与分布太多");
+        }
+        let window = self.to_ms - self.from_ms;
+        for span in &self.spans {
+            if !name_ok(&span.name) {
+                return Err("区间的名字不对");
+            }
+            if !time_ok(span.start_ms) || !time_ok(span.dur_ms) || span.start_ms > window {
+                return Err("区间的时刻不对");
+            }
+        }
+        if self.counters.iter().any(|c| !name_ok(&c.name)) {
+            return Err("计数的名字不对");
+        }
+        for hist in &self.histograms {
+            if !name_ok(&hist.name) {
+                return Err("分布的名字不对");
+            }
+            if hist.buckets.len() != PERF_HISTOGRAM_BOUNDS_MS.len() + 1
+                || hist.buckets.iter().sum::<u64>() != hist.count
+                || !time_ok(hist.sum_ms)
+                || !time_ok(hist.max_ms)
+            {
+                return Err("分布的形状不对");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 一个耗时落在自报分布的第几个桶。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::method::{perf_bucket_of, PERF_HISTOGRAM_BOUNDS_MS};
+/// assert_eq!(perf_bucket_of(0.5), 0);
+/// assert_eq!(perf_bucket_of(1.0), 0);
+/// assert_eq!(perf_bucket_of(1.5), 1);
+/// assert_eq!(perf_bucket_of(9_999.0), PERF_HISTOGRAM_BOUNDS_MS.len());
+/// ```
+pub fn perf_bucket_of(ms: f64) -> usize {
+    PERF_HISTOGRAM_BOUNDS_MS
+        .iter()
+        .position(|bound| ms <= *bound)
+        .unwrap_or(PERF_HISTOGRAM_BOUNDS_MS.len())
+}
+
 #[cfg(test)]
 mod tests {
+    // 契约 provider-protocol v32：perf/* 的线上形状是驼峰、可选字段缺省为空；不声明 perf 的能力清单写回不多出键。
+    #[test]
+    fn perf_shapes_round_trip_and_are_bounded() {
+        use super::*;
+        use serde_json::json;
+        let start: PerfStartParams =
+            serde_json::from_value(json!({ "session": 3, "intervalMs": 1000 })).unwrap();
+        assert_eq!(start.interval_ms, 1000);
+        let report: PerfReportParams = serde_json::from_value(json!({
+            "session": 3, "seq": 0, "fromMs": 10.0, "toMs": 1010.0,
+            "spans": [{ "name": "处理 · messages/list", "startMs": 5.0, "durMs": 120.0 }],
+            "histograms": [{ "name": "处理 · messages/list", "count": 2, "sumMs": 130.0, "maxMs": 120.0,
+                "buckets": [0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0] }]
+        }))
+        .unwrap();
+        assert!(report.counters.is_empty());
+        assert_eq!(report.check(), Ok(()));
+        let mut bad = report.clone();
+        bad.histograms[0].buckets.pop();
+        assert_eq!(bad.check(), Err("分布的形状不对"));
+        let mut bad = report.clone();
+        bad.spans = vec![report.spans[0].clone(); crate::budget::PERF_SPANS_MAX + 1];
+        assert_eq!(bad.check(), Err("区间太多"));
+        let mut bad = report.clone();
+        bad.spans[0].start_ms = 5_000.0;
+        assert_eq!(bad.check(), Err("区间的时刻不对"));
+        let mut bad = report;
+        bad.counters = (0..crate::budget::PERF_SERIES_MAX)
+            .map(|i| PerfCounter {
+                name: format!("c{i}"),
+                value: 1,
+            })
+            .collect();
+        assert_eq!(bad.check(), Err("计数与分布太多"));
+
+        let caps = crate::Capabilities::default();
+        assert!(serde_json::to_value(&caps).unwrap().get("perf").is_none());
+        let declared: crate::Capabilities =
+            serde_json::from_value(json!({ "perf": true })).unwrap();
+        assert!(declared.perf);
+        for (m, name) in [
+            (Method::PerfStart, "perf/start"),
+            (Method::PerfStop, "perf/stop"),
+            (Method::PerfReport, "perf/report"),
+        ] {
+            assert_eq!(m.as_str(), name);
+            assert_eq!(Method::from_name(name), Some(m));
+        }
+    }
+
     #[test]
     fn maintenance_shapes_round_trip_and_updates_explicitly_replace_flags() {
         use serde_json::json;
@@ -2244,6 +2490,24 @@ mod tests {
         }
         let shown = format!("{avatar:?}");
         assert!(!shown.contains("iVBORw"), "日志里不该有图片字节：{shown}");
+    }
+
+    #[test]
+    fn host_user_name_has_only_the_optional_public_name() {
+        use serde_json::json;
+        assert_eq!(Method::HostUserName.as_str(), "host/userName");
+        assert_eq!(
+            Method::from_name("host/userName"),
+            Some(Method::HostUserName)
+        );
+        let absent: HostUserNameResult = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(serde_json::to_value(absent).unwrap(), json!({}));
+        let named: HostUserNameResult =
+            serde_json::from_value(json!({"name": "梨子 小明"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(named).unwrap(),
+            json!({"name": "梨子 小明"})
+        );
     }
 
     // 契约 provider-protocol v12：登录、续期、交接相关的新字段都是可选的——旧插件、旧宿主的形状照读，写回不多出键。

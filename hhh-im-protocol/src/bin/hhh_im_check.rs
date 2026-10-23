@@ -104,6 +104,8 @@ struct Collected {
     login_steps: Vec<Value>,
     push_count: usize,
     credential_saved: bool,
+    /// 收到的 `perf/report`（契约 provider-protocol v32）。
+    perf_reports: Vec<Value>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -227,6 +229,8 @@ async fn run(args: Args) -> i32 {
                                 .unwrap()
                                 .login_steps
                                 .push(params["step"].clone());
+                        } else if method == "perf/report" {
+                            collected.lock().unwrap().perf_reports.push(params);
                         }
                     }
                 }
@@ -325,6 +329,7 @@ async fn run(args: Args) -> i32 {
         Err(error) => report.fail("旧消息维护声明合法", error),
     }
     check_v13_declarations(&mut report, &init);
+    check_v31_declarations(&mut report, &platform);
 
     // 4. session/open。
     let open = call_t(
@@ -369,6 +374,10 @@ async fn run(args: Args) -> i32 {
     tokio::time::sleep(Duration::from_millis(300)).await;
     check_v12_calls(&conn, &mut report, &caps, online).await;
     check_v13_calls(&conn, &mut report, &init, online).await;
+    check_v31_calls(&conn, &mut report, &platform, &caps, online).await;
+    if caps.perf {
+        check_perf(&conn, &mut report, &collected).await;
+    }
 
     // 5–7. 推送数据的检查（push-only 平台）。
     if platform.history == HistoryMode::None && online {
@@ -393,7 +402,7 @@ async fn run(args: Args) -> i32 {
     // 9. 发送。
     match (&args.allow_send, caps.send.as_ref()) {
         (Some(conv), Some(send)) if send.text => {
-            check_send(&conn, &mut report, conv).await;
+            check_send(&conn, &mut report, conv, caps.agent_attribution.send).await;
         }
         (Some(_), _) => report.skip("发送检查", "插件未声明发文字能力"),
         (None, Some(send)) if send.is_read_only() => {
@@ -676,6 +685,72 @@ async fn check_v13_calls(conn: &Arc<Connection>, report: &mut Report, init: &Val
     }
 }
 
+/// 契约 provider-protocol v32：声明了 `perf` 时，`perf/start` 后按间隔收到合规的 `perf/report`，`perf/stop` 后不再收到。
+async fn check_perf(
+    conn: &Arc<Connection>,
+    report: &mut Report,
+    collected: &Arc<Mutex<Collected>>,
+) {
+    use hhh_im_protocol::budget::{PERF_INTERVAL_MIN_MS, PERF_REPORT_BYTES_MAX};
+    use hhh_im_protocol::method::PerfReportParams;
+    const SESSION: u64 = 1;
+    let interval = Duration::from_millis(PERF_INTERVAL_MIN_MS);
+    if let Err(e) = call_t(
+        conn,
+        "perf/start",
+        json!({ "session": SESSION, "intervalMs": PERF_INTERVAL_MIN_MS }),
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        report.fail("声明了 perf 时按间隔自报", format!("perf/start：{e}"));
+        return;
+    }
+    tokio::time::sleep(interval * 3 + Duration::from_millis(200)).await;
+    let reports = std::mem::take(&mut collected.lock().unwrap().perf_reports);
+    let problem = if reports.is_empty() {
+        Some("perf/start 之后没收到 perf/report".to_owned())
+    } else {
+        reports.iter().find_map(|raw| {
+            if raw.to_string().len() > PERF_REPORT_BYTES_MAX {
+                return Some("一条报告超过 64 KiB".to_owned());
+            }
+            match serde_json::from_value::<PerfReportParams>(raw.clone()) {
+                Err(e) => Some(format!("报告格式不对：{e}")),
+                Ok(r) if r.session != SESSION => Some(format!("报告的会话编号是 {}", r.session)),
+                Ok(r) => r.check().err().map(str::to_owned),
+            }
+        })
+    };
+    match problem {
+        None if reports.len() <= 4 => report.pass("声明了 perf 时按间隔自报"),
+        None => report.fail(
+            "声明了 perf 时按间隔自报",
+            format!("1.7 秒里收到 {} 条，比间隔密", reports.len()),
+        ),
+        Some(why) => report.fail("声明了 perf 时按间隔自报", why),
+    }
+    if let Err(e) = call_t(
+        conn,
+        "perf/stop",
+        json!({ "session": SESSION }),
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        report.fail("perf/stop 后不再自报", format!("perf/stop：{e}"));
+        return;
+    }
+    // 停之前已经在路上的那一条不算。
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    collected.lock().unwrap().perf_reports.clear();
+    tokio::time::sleep(interval * 2 + Duration::from_millis(200)).await;
+    match collected.lock().unwrap().perf_reports.len() {
+        0 => report.pass("perf/stop 后不再自报"),
+        n => report.fail("perf/stop 后不再自报", format!("停了以后还收到 {n} 条")),
+    }
+}
+
 /// 带一个括号的写法（正文表情写法、头像身份）的问题：编不过、或没有一个括号（第一个括号是 `group`）。按常用写法核对，
 /// 不支持前后断言等少见写法。
 fn pattern_problem(pattern: &str, group: &str) -> Option<String> {
@@ -686,6 +761,148 @@ fn pattern_problem(pattern: &str, group: &str) -> Option<String> {
         Err(e) => Some(format!("编不过：{e}")),
         Ok(re) if re.captures_len() < 2 => Some(format!("要有一个括号，第一个括号是{group}")),
         Ok(_) => None,
+    }
+}
+
+/// 契约 provider-protocol v31：表情写进文字的写法，声明了就要写对，没声明的跳过（输入框没有表情按钮）。
+fn check_v31_declarations(report: &mut Report, platform: &PlatformDesc) {
+    use hhh_im_protocol::platform::TextTemplate;
+    match platform
+        .emoji
+        .as_ref()
+        .and_then(|emoji| emoji.text_template.as_deref())
+    {
+        None => report.skip(
+            "表情写法格式对",
+            "没声明 emoji.textTemplate（输入框没有表情按钮）",
+        ),
+        Some(template) => match TextTemplate::parse(template) {
+            Ok(_) => report.pass("表情写法格式对"),
+            Err(why) => report.fail("表情写法格式对", why),
+        },
+    }
+}
+
+/// 契约 provider-protocol v31：读一次表情目录，核对它与写法、分类图标对得上（[`check_v31_catalog`]）。
+async fn check_v31_calls(
+    conn: &Arc<Connection>,
+    report: &mut Report,
+    platform: &PlatformDesc,
+    caps: &Capabilities,
+    online: bool,
+) {
+    const CHECKS: [&str; 2] = ["写进文字的表情认得回来", "分类图标宿主认得"];
+    if !caps.reactions.catalog {
+        for name in CHECKS {
+            report.skip(name, "没声明 reactions.catalog");
+        }
+        return;
+    }
+    let catalog = match call_t(conn, "emoji/catalog", json!({}), Duration::from_secs(30)).await {
+        Ok(value) => serde_json::from_value::<hhh_im_protocol::method::EmojiCatalogResult>(value)
+            .map_err(|e| format!("表情目录格式不对：{e}")),
+        Err(_) if !online => {
+            for name in CHECKS {
+                report.skip(name, "没登录，读不了表情目录");
+            }
+            return;
+        }
+        Err(e) => Err(e),
+    };
+    match catalog {
+        Ok(catalog) => check_v31_catalog(report, platform, &catalog),
+        Err(why) => {
+            for name in CHECKS {
+                report.fail(name, why.clone());
+            }
+        }
+    }
+}
+
+/// 表情目录与写法、分类图标对得上（v31）：能写进文字的每个表情，按 `textTemplate` 写出来的文字要被 `textPattern`
+/// 整段认出、认出的名字或编号（按占位）对得回它——插进输入框发出去的在 HHH 里显示成图；分类给的图标在宿主的图标库里。
+fn check_v31_catalog(
+    report: &mut Report,
+    platform: &PlatformDesc,
+    catalog: &hhh_im_protocol::method::EmojiCatalogResult,
+) {
+    use hhh_im_protocol::platform::{TemplateSlot, TextTemplate};
+    let rules = platform.emoji.as_ref();
+    let template = rules
+        .and_then(|e| e.text_template.as_deref())
+        .and_then(|t| TextTemplate::parse(t).ok());
+    let pattern = rules
+        .and_then(|e| e.text_pattern.as_deref())
+        .and_then(|p| regex_lite::Regex::new(p).ok());
+    const ROUND_TRIP: &str = "写进文字的表情认得回来";
+    match (template, pattern) {
+        (None, _) => report.skip(ROUND_TRIP, "没声明 emoji.textTemplate，或写法不对"),
+        (Some(_), None) => report.skip(
+            ROUND_TRIP,
+            "没声明能用的 emoji.textPattern（宿主不把正文里写的表情换成图，插件读回时自己翻成表情的不受影响）",
+        ),
+        (Some(template), Some(pattern)) => {
+            let mut wrong = Vec::new();
+            let mut checked = 0usize;
+            for emoji in catalog.emojis.iter().filter(|e| e.in_text) {
+                let value = match template.slot() {
+                    TemplateSlot::Type => emoji.emoji_type.as_str(),
+                    // 用名字写的写法里，没有名字的表情写不进文字。
+                    TemplateSlot::Name => match emoji.name.as_deref() {
+                        Some(name) => name,
+                        None => continue,
+                    },
+                };
+                checked += 1;
+                let text = template.write(value);
+                let found = pattern.captures(&text).filter(|c| c.get(0).is_some_and(|m| m.as_str() == text));
+                if found.and_then(|c| c.get(1)).map(|m| m.as_str()) != Some(value) {
+                    wrong.push(text);
+                }
+            }
+            if checked == 0 {
+                report.skip(ROUND_TRIP, "目录里没有能写进文字的表情");
+            } else if wrong.is_empty() {
+                report.pass(ROUND_TRIP);
+            } else {
+                let shown: Vec<&str> = wrong.iter().take(5).map(String::as_str).collect();
+                report.fail(
+                    ROUND_TRIP,
+                    format!(
+                        "{} 个写出来的文字 textPattern 认不回原表情（如 {}）；写不进文字的表情标 inText: false",
+                        wrong.len(),
+                        shown.join("、")
+                    ),
+                );
+            }
+        }
+    }
+    const ICONS: &str = "分类图标宿主认得";
+    if catalog.categories.is_empty() {
+        report.skip(ICONS, "目录不分类");
+    } else {
+        let unknown: Vec<&str> = catalog
+            .categories
+            .iter()
+            .filter(|c| {
+                c.icon.as_deref().is_some_and(|icon| {
+                    !hhh_im_protocol::types::EMOJI_CATEGORY_ICONS.contains(&icon)
+                })
+            })
+            .map(|c| c.id.as_str())
+            .collect();
+        if unknown.is_empty() {
+            report.pass(ICONS);
+        } else {
+            report.fail(
+                ICONS,
+                format!(
+                    "分类 {} 的 icon 不在宿主图标库里（会画成圆），可用：{}",
+                    unknown.join("、"),
+                    hhh_im_protocol::types::EMOJI_CATEGORY_ICONS.join("、")
+                ),
+            );
+        }
     }
 }
 
@@ -918,21 +1135,33 @@ async fn check_resource_read(
     }
 }
 
-async fn check_send(conn: &Arc<Connection>, report: &mut Report, conv: &str) {
+async fn check_send(conn: &Arc<Connection>, report: &mut Report, conv: &str, attribution: bool) {
     let op = format!("check-{}", std::process::id());
-    let r = conn
-        .call(
-            "messages/send",
-            json!({
-                "operationId": op,
-                "target": { "type": "conversation", "conversationId": conv },
-                "content": [ { "type": "text", "text": "hhh-im-check 测试消息" } ]
-            }),
-        )
-        .await;
+    let mut params = json!({
+        "operationId": op,
+        "target": { "type": "conversation", "conversationId": conv },
+        "content": [ { "type": "text", "text": "hhh-im-check 测试消息" } ]
+    });
+    let signature = json!({"name":"HHH 自检伙伴","automatic":true});
+    if attribution {
+        params["agentAttribution"] = signature.clone();
+    }
+    let r = conn.call("messages/send", params).await;
     match r {
         Ok(v) if v["state"] == "accepted" || v["state"] == "unknown" => {
             report.pass("发送返回 accepted 或 unknown");
+            if attribution {
+                if v["state"] == "unknown" {
+                    report.skip("伙伴署名发送回包", "平台未确认是否发出，不能判定署名已保留");
+                } else if v["message"]["agentAttribution"] == signature {
+                    report.pass("伙伴署名发送回包");
+                } else {
+                    report.fail(
+                        "伙伴署名发送回包",
+                        "已声明传递能力，但发送回包未保留伙伴署名",
+                    );
+                }
+            }
         }
         Ok(v) => report.fail(
             "发送返回 accepted 或 unknown",
@@ -1076,6 +1305,106 @@ mod v12_tests {
             rows(&report)
         );
         assert!(pattern_problem("(", "表情名").is_some(), "编不过");
+    }
+
+    // 契约 provider-protocol v31：写法没声明跳过、写对通过、写错失败；目录里写进文字的要认得回来，标了不能写进文字的不查；
+    // 分类图标不在图标库里失败。
+    #[test]
+    fn v31_text_template_and_catalog_checks() {
+        let desc = |emoji: Value| -> PlatformDesc {
+            serde_json::from_value(json!({ "avatarShape": "rounded", "history": "none", "actions": {}, "emoji": emoji }))
+                .unwrap()
+        };
+        let unlisted = json!({ "placeholderLabel": "表情" });
+        let catalog = |value: Value| -> hhh_im_protocol::method::EmojiCatalogResult {
+            serde_json::from_value(value).unwrap()
+        };
+        let mut report = Report::new();
+        check_v31_declarations(&mut report, &desc(json!({ "unlisted": unlisted })));
+        assert_eq!(status_of(&report, "表情写法格式对"), "skip");
+        let mut report = Report::new();
+        check_v31_declarations(
+            &mut report,
+            &desc(json!({ "unlisted": unlisted, "textTemplate": "[{name}]" })),
+        );
+        assert_eq!(status_of(&report, "表情写法格式对"), "pass");
+        let mut report = Report::new();
+        check_v31_declarations(
+            &mut report,
+            &desc(json!({ "unlisted": unlisted, "textTemplate": "[赞]" })),
+        );
+        assert_eq!(status_of(&report, "表情写法格式对"), "fail");
+
+        // 名字写法：认得回来通过；不能写进文字的、没有名字的不查。
+        let named = desc(
+            json!({ "unlisted": unlisted, "textTemplate": "[{name}]", "textPattern": "\\[([^\\[\\]\\r\\n]{1,12})\\]" }),
+        );
+        let feishu_like = catalog(json!({ "updatedAtMs": 1, "emojis": [
+            { "emojiType": "THUMBSUP", "name": "赞" },
+            { "emojiType": "2021", "name": "这个名字太长了写进去认不回来一二三", "inText": false },
+            { "emojiType": "NONAME" }
+        ] }));
+        let mut report = Report::new();
+        check_v31_catalog(&mut report, &named, &feishu_like);
+        assert_eq!(
+            status_of(&report, "写进文字的表情认得回来"),
+            "pass",
+            "{:?}",
+            rows(&report)
+        );
+        assert_eq!(status_of(&report, "分类图标宿主认得"), "skip");
+
+        // 编号写法：肤色版本也要整段认出；认出的不是原编号就失败。
+        let slack_like = catalog(json!({ "updatedAtMs": 1, "emojis": [
+            { "emojiType": "+1" }, { "emojiType": "wave::skin-tone-3", "panel": false }
+        ], "categories": [{ "id": "people", "name": "人物", "icon": "smileys" }, { "id": "mine", "name": "自定义" }] }));
+        let typed = |pattern: &str| {
+            desc(
+                json!({ "unlisted": unlisted, "textTemplate": ":{type}:", "textPattern": pattern }),
+            )
+        };
+        let mut report = Report::new();
+        check_v31_catalog(
+            &mut report,
+            &typed(":([a-z0-9_+'-]+(?:::skin-tone-[2-6])?):"),
+            &slack_like,
+        );
+        assert_eq!(
+            status_of(&report, "写进文字的表情认得回来"),
+            "pass",
+            "{:?}",
+            rows(&report)
+        );
+        assert_eq!(
+            status_of(&report, "分类图标宿主认得"),
+            "pass",
+            "没给图标的分类画圆，不算错"
+        );
+        let mut report = Report::new();
+        check_v31_catalog(&mut report, &typed(":([a-z0-9_+'-]+):"), &slack_like);
+        let row = report
+            .rows
+            .iter()
+            .find(|(n, _, _)| n == "写进文字的表情认得回来")
+            .unwrap();
+        assert!(
+            matches!(row.1, Status::Fail) && row.2.contains(":wave::skin-tone-3:"),
+            "{}",
+            row.2
+        );
+
+        // 只写了写法、没写正文写法：跳过；分类图标不认识：失败。
+        let odd_icon = catalog(
+            json!({ "updatedAtMs": 1, "emojis": [], "categories": [{ "id": "a", "name": "甲", "icon": "rocket" }] }),
+        );
+        let mut report = Report::new();
+        check_v31_catalog(
+            &mut report,
+            &desc(json!({ "unlisted": unlisted, "textTemplate": ":{type}:" })),
+            &odd_icon,
+        );
+        assert_eq!(status_of(&report, "写进文字的表情认得回来"), "skip");
+        assert_eq!(status_of(&report, "分类图标宿主认得"), "fail");
     }
 
     // 契约 provider-protocol v13：操作声明没声明跳过、写对通过、写错失败；声明了 host 登录时给出“只有官方插件能用”的提示。

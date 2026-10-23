@@ -192,6 +192,8 @@ impl Segments {
             }
         };
         let chunk = stream.segment(length).await?;
+        // 剖析开着时数交出了多少字节（base64 四个字符三个字节，契约 provider-protocol v32 §4）。
+        super::perf::count_current(super::perf::SEGMENT_BYTES, chunk.data.len() as u64 / 4 * 3);
         if !chunk.eof {
             self.keep(stream);
         }

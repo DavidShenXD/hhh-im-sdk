@@ -65,7 +65,7 @@
 ## 3. 传输
 
 - 消息格式是 **JSON-RPC 2.0**。宿主发给程序的消息走程序的标准输入，程序发给宿主的走标准输出。编码 UTF-8，**一行一条消息**：以 `\n` 结尾，消息内部不能出现原始换行。
-- 双方都可以发请求和通知。程序发给宿主的请求只有本文列出的几种（§6.3、§11.1）。
+- 双方都可以发请求和通知。程序发给宿主的请求限于本文定义的方法，包括可选宿主显示名（§4.5）、保存凭据（§6.3）、读取额度（§8）与推送（§11.1）。
 - **标准输出只能输出协议消息。** 宿主每读到一行不合法的 JSON-RPC，记一次协议错误；同一个进程连续 3 次，宿主就重启它。
 - **标准错误输出是日志**：每行一条。宿主把每行截到 4 KiB，标上程序编号，写进 HHH 日志。日志里不要写凭据和消息正文。
 - **单条消息最大 4 MiB**。超过的消息宿主直接丢掉，按协议错误处理。大文件要分段传（§9）。
@@ -152,6 +152,16 @@
 - 程序退出或卡死时，宿主按 1、2、4……最长 60 秒的间隔退避重启。10 分钟内重启 5 次还不行，宿主就停下来，在界面上把这个连接标成“程序出错”，并附上最后几行日志。
 - 每次重启都从 `initialize` 开始，再用保存的凭据和同步位置接着上次的进度。
 
+### 4.5 host/userName（程序→宿主，可选）
+
+`initialize` 完成后，程序可以按需发送 `host/userName`，参数为空对象 `{}`。结果为 `{ "name": "用户显示名" }`，无可用名字时为 `{}`。
+
+- `name` 是当前业务用户自己已保存的显示名；在 Friend 中来自个人资料，游客同样适用。它不是 IM 昵称、操作系统用户名或登录令牌。
+- 仅返回名字，不附身份编号、邮箱、头像、SOUL 或凭据。自定义与官方插件均可请求；不赋予“用宿主账号登录”的权限。
+- 每次请求读取当前值。连接撤销或所属身份已切换时返回 `{}`，不交出另一个身份的资料。程序不应持久化副本。
+- 旧宿主可能回复 `{}` 或方法不存在；程序必须有无名字的默认行为，并为可选请求设置短超时，不以此阻止登录与使用。不要在处理 `initialize` 时等待此请求，以免握手互相等待。
+- 各 IM 如何使用这个名字由程序决定，宿主不规定平台设备名格式。
+
 ## 5. 平台说明与能力
 
 ### 5.1 平台说明（`platform`）
@@ -183,7 +193,7 @@
 | `reactionsInReads` | 布尔 | 否 | 读消息时会随消息带回完整的表情。默认假 |
 | `emojiPerAccount` | 布尔 | 否 | 不同账号的表情目录不一样。默认假 |
 | `actions` | 见下文 | 是 | 每条消息允许哪些操作 |
-| `emoji` | `{namePattern, unlisted: {placeholderPattern, placeholderLabel, guess?, guessPattern?}, textPattern?, whiteBackground?}` | 有表情能力时必需 | 表情编号的规则（正则，JavaScript 语法；v14 起宿主照它核对点表情的编号），以及目录里没有的表情怎么显示（v14 起宿主照 `placeholderPattern`、`placeholderLabel` 画占位）。v12：`unlisted.guess` 为真时，目录外的表情类型也问 `emoji/image` 要图（§9.1），v14：`guessPattern` 给了就只拿合它的类型去问（猜不出的如飞书企业表情的纯数字编号不必每次问）；`textPattern` 是正文里表情的写法（JavaScript 正则，第一个括号是表情名，例如飞书的 `\[([^\[\]\r\n]{1,12})\]`），宿主把正文里这样写、目录里有这个名字的换成表情图，不写就不换；`whiteBackground` 为真时表情图是白底的，宿主显示前抠成透明 |
+| `emoji` | `{namePattern, unlisted: {placeholderPattern, placeholderLabel, guess?, guessPattern?}, textPattern?, whiteBackground?, textTemplate?}` | 有表情能力时必需 | 表情编号的规则（正则，JavaScript 语法；v14 起宿主照它核对点表情的编号），以及目录里没有的表情怎么显示（v14 起宿主照 `placeholderPattern`、`placeholderLabel` 画占位）。v12：`unlisted.guess` 为真时，目录外的表情类型也问 `emoji/image` 要图（§9.1），v14：`guessPattern` 给了就只拿合它的类型去问（猜不出的如飞书企业表情的纯数字编号不必每次问）；`textPattern` 是正文里表情的写法（JavaScript 正则，第一个括号是表情名，例如飞书的 `\[([^\[\]\r\n]{1,12})\]`），宿主把正文里这样写、目录里有这个名字的换成表情图，不写就不换；`whiteBackground` 为真时表情图是白底的，宿主显示前抠成透明。v31：`textTemplate` 是表情写进文字的写法，恰好一个占位 `{name}`（目录里的名字）或 `{type}`（表情编号），不含换行与控制字符，去掉占位后至多 16 个字符（如飞书、微信 `[{name}]`，Slack `:{type}:`）；宿主据此把输入框表情面板里点的表情插进文字，不写就没有输入框的表情按钮，写法不合要求当没写。`textPattern` 的第一个括号认出的是 `textTemplate` 里占位的那一项：写法用 `{type}` 时是表情编号，用 `{name}` 或没写写法时是名字 |
 
 `actions` 用下面的声明式规则写，由宿主用通用代码计算消息可用的操作：
 
@@ -231,8 +241,11 @@
 - v15：`people.bots` 为真时程序能按编号读机器人与应用（`people/get` 的 `bots`），要先声明 `people.get`；不写时宿主把机器人一律记成“没有”、不为它们问程序。`people.batchMax`（1–2000）是一次 `people/get` 最多问几个，平台一次读一大批更省时写（如读一遍整份成员名单就认出一大批人）；不写是 100。
 - v35：`account.hostAvatar` 为真时程序收宿主交来的本机用户头像（`account/avatar`，§6.8），拿去设置本人在这家 IM 里的头像；不写时宿主不交，线上不出现 `account`。
 
+- v32：`perf` 为真时程序能自报内部耗时（§11.6）；不写时宿主不发任何 `perf/*`。
+
 - `retranslate` 为真时，程序随消息附带去凭据化的原始数据（§7.4 的 `raw`），宿主存一张原始数据表；程序翻译规则升级后，宿主调 `messages/retranslate`（§10.1）让它把本地旧消息重新翻译一遍。为假时不附带原始数据、也不会被调用重译。
 - `messageMaintenance`（可选，默认假）允许宿主把已存的统一消息交给程序做本地修正或重读判定，不依赖 `raw`，不替代 `retranslate`。旧程序省略此能力照常接入。
+- `agentAttribution: {send, receive}`（可选）分别声明跨账号发送和接收伙伴署名，规则见 §7.4a；两项默认 false。send 要求可发文字，receive 要求可读取或接收消息。
 
 - **只读连接**：`send` 为 null，或者其中各项都是 false。宿主不显示输入框，伙伴不在这个连接上回复，所有发送请求都在本地直接拒绝。
 - `history=server` 时，`messages.list` 必须为真。`history=none` 时，`events.messages` 必须为真。
@@ -424,6 +437,21 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 - `editDraft`（v12）：声明了 `actions.edit.perMessage` 时，本人能编辑的那条给出编辑框里的原文（`Outgoing` 数组，块数预算同发送）；不能编辑就不带。
 - `raw` 只在声明了 `retranslate` 能力时给（§10.1）：`format` 是程序自己定的格式名（例如 `wechat-addmsg-v1`），`data` 是去凭据化的原始数据。宿主把它和消息一起存进原始数据表，供以后重新翻译；**不含任何令牌、密钥、会话材料**。单条上限见 §14。
 
+### 7.4a 伙伴代发署名（可选）
+
+`Message.agentAttribution` 与 `messages/send.agentAttribution` 使用同一形状：
+
+```json
+{"name":"派派","avatar":"data:image/png;base64,…","automatic":true}
+```
+
+- `name` 必填，1–512 个 UTF-8 字节，不能全空白或包含控制字符；`automatic` 默认 false，true 表示这一版实际自动发送。`avatar` 可省略，只能是完整 URL 不超过 24 KiB 的静态 PNG、JPEG、WebP base64 data URL。宿主发送端生成至多 64×64 的小图；没有可用头像时接收端使用默认伙伴头像，不传本机路径、宿主 HTTP 路径、外部地址或 SVG。
+- `capabilities.agentAttribution: {send, receive}` 两项默认 false，全 false 时省略。send 要求 `send.text`；receive 要求 `messages.list/get` 或 `events.messages`。宿主只向声明 send 的插件发送这个新参数；未声明的旧插件保持原请求形状。
+- send 表示插件能将署名随消息传到接收账号，receive 表示插件能从平台数据还原它。具体平台的编码与解码由插件完成；仅在本机按操作编号记一份映射不算跨账号能力。没有可靠的传递方式时不声明，不以正文尾句猜测代发身份。
+- 声明能力的插件须在发送回包、lookup、历史列表、单条读取、推送、话题与会话副本里保留同一快照；编辑只改正文，继续返回原署名，撤回后界面隐藏署名。重试同一操作沿用原快照，不随伙伴后来的改名、换头像更新。
+- 接收端不依赖本机运行记录；署名只承载名字、头像和自动状态，发送者仍是平台账号。它不是身份认证、不能授予执行日志访问权，不包含本机任务编号、工作目录或凭据。无此字段的消息沿用普通消息与本机旧记录的显示。
+- 损坏、超出预算的署名只丢弃署名；坏头像只丢弃头像，保留有效名字。正文与同批其它消息继续读取。署名不进入正文、提示词、搜索或正文复制；不改变平台原有的正文尾句等其它展示机制。
+
 ### 7.5 内容块（Block）
 
 | `type` | 字段 | 说明 |
@@ -437,6 +465,8 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 | `unsupported` | `kind`、`label`? | 暂时翻译不了的内容。出现它时，整条消息要标 `incomplete: true` |
 
 宿主遇到不认识的 `type` 时，按 `unsupported` 显示，消息照常保存。
+
+消息身份完整时，无法解析的内容块也在原位置转成 `unsupported`，同条其余内容保留，并标 `incomplete: true`；未撤回但正文为空或格式不完整时留下通用消息占位。实时推送、消息历史、补读与发送/编辑结果共用这一接收边界。`raw` 仍只由插件按 §7.4 提供，不从异常 JSON 自动构造。
 
 **Resource**：`{ "key", "kind": "image|file|sticker", "mime"?, "bytes"?, "durationMs"? }`
 
@@ -486,7 +516,8 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 - **许可交付回执**（可选）：支持回执的程序发送 `requests/acquire {permit, receipt: true}`。宿主可返回 `{granted: true, receipt: "不透明回执编号"}`；程序收到后，在开始这条平台读取前立即发通知 `requests/received {receipt: "该编号"}`，不等 HTTP 完成。编号必须是 1–128 字节的字符串；无效时停止读取。宿主同一平台最多保留一份未确认交付的许可，收到回执后从此时刻重新计算这笔读取的秒、分钟窗口，不能重复记账。原调用结束、取消或断连时释放其回执；迟到、重复或未知回执不影响其它调用。旧插件不传 `receipt: true` 时宿主不要求回执；旧宿主回复中省略 `receipt` 时新 SDK 沿用明确许可模式。完整的延迟交付保护需要双方支持回执，协议主版本不变。
 - **这次向平台发了几个请求**（v14，可选）：上表每个方法的结果对象都可以多带 `"platformRequests": <正整数>`。没有协商发送前申请额度时，宿主每调一次先记一次平台读取，多出的在结果返回后记进这个平台的读取额度（一次调用至多按 64 个记），之后的读取据此等；不写就是 1。已逐条放行的调用不再按这个字段重复扣额度。
 - **读取不能有副作用**：不能借读取在平台上标已读，也不能改变在线状态。已读未读只在 HHH 本地计算。
-- Emoji 的字段同 hhh-im 的 `EmojiInfo`，只是图片地址换成 `emoji/image` 用的编号。
+- Emoji 的字段同 hhh-im 的 `EmojiInfo`，只是图片地址换成 `emoji/image` 用的编号。v31：Emoji 可带 `inText`（布尔，默认真），假时这个表情不能按 `emoji.textTemplate` 写进文字（只能点成回应），输入框的表情面板不列它；与 `panel`（能不能点成回应）互相独立。用 `{name}` 写法而表情没有名字的也写不进文字。
+- `categories` 的每一项是 `{id, name, icon?}`。v31：`icon` 指定分类标签画宿主图标库里的哪个图标，取 `smileys`、`nature`、`food`、`travel`、`activities`、`objects`、`symbols`、`flags`、`custom` 之一（协议包 `types::EMOJI_CATEGORY_ICONS`）；没写或不在表里时宿主画圆，分类编号本身不决定图标。
 
 ## 9. 资源
 
@@ -519,7 +550,7 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 
 | 方法 | 参数 | 结果 | 需要的能力 |
 |---|---|---|---|
-| `messages/send` | `operationId`、`target`、`content: Outgoing[]` | `{state: "accepted", message}` 或 `{state: "unknown", reason}` | `send` 里对应的项 |
+| `messages/send` | `operationId`、`target`、`content: Outgoing[]`、`agentAttribution?` | `{state: "accepted", message}` 或 `{state: "unknown", reason}` | `send` 里对应的项；署名另需 `agentAttribution.send` |
 | `messages/lookupSend` | `operationId` | 同上 | `send.lookup` |
 | `messages/recall` | `conversationId`、`messageId` | `{}` | `recall` |
 | `messages/edit` | `conversationId`、`messageId`、`content` | 编辑后的 `Message` | `edit` |
@@ -577,6 +608,8 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 
 ### 11.2 事件种类
 
+未知事件按 §16 记日志后只跳过该事件，其余事件照常接收。必要的消息身份或推送信封无法解析时，宿主回复 `-32602`，不成功确认、不推进 `syncState`；程序应保留这一批，修正后重试。接收失败的诊断不记录消息正文与不透明原始字段。
+
 | `type` | 字段 | 说明 |
 |---|---|---|
 | `messages` | `conversationId`、`messages[]` | 新到的或有变化的消息，包括编辑、撤回成标记、话题根消息的变化。同一条消息以最新收到的为准 |
@@ -616,6 +649,23 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 
 - `message` 和 `fields` 里**不能含凭据、消息正文、令牌**。宿主按 §14 截断过长的内容。
 - 这条通知只是把程序内部的日志透出来，便于排查；程序照常也可以写标准错误输出（§3），两者宿主都收。
+
+### 11.6 性能自报（v32，可选，需要 `perf` 能力）
+
+HHH 的性能剖析开着时，程序可以把自己内部的耗时报给宿主。不声明 `perf` 的程序收不到任何 `perf/*`，行为不变。
+
+| 方向 | 方法 | 参数 |
+|---|---|---|
+| 宿主→程序（请求） | `perf/start` | `{ "session": <整数>, "intervalMs": <整数，≥ 500> }`：剖析开启时发给每个声明了的在跑程序；剖析期间程序重启后补发 |
+| 程序→宿主（通知） | `perf/report` | `{ "session", "seq", "fromMs", "toMs", "spans": [{ "name", "startMs", "durMs" }], "counters": [{ "name", "value" }], "histograms": [{ "name", "count", "sumMs", "maxMs", "buckets": [] }] }`：每个间隔至多一条 |
+| 宿主→程序（请求） | `perf/stop` | `{ "session" }`：剖析关闭时；之后同一 `session` 的报告宿主丢弃 |
+
+- `fromMs` / `toMs` 是程序自己的单调时钟，`startMs` 是相对 `fromMs` 的偏移；宿主按收到的时刻对齐，不信程序的绝对时间。
+- `counters` 是本间隔的增量；`histograms` 的 `buckets` 按固定边界 `[1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]` 毫秒，比边界多一个（最后一个装超过 5000 的）。
+- `spans` 只报最慢与超过阈值的区间，其余进分布。
+- `name` 只能是协议方法名或程序固定的标签（如 `GET /open-apis/im/v1/messages`），不能含会话、消息、人员编号，正文、令牌与 URL 参数。
+- 超出 §14 的自报上限时宿主丢掉整条并计数，不当作协议错误、不断开程序。
+- 用 SDK `runtime` 的程序自动声明并上报：每个宿主请求的排队与处理耗时、平台请求次数与耗时、等待放行、分段与上传字节、程序内 Tokio 的存活任务与繁忙度。
 
 ## 12. 错误
 
@@ -672,6 +722,8 @@ JSON-RPC 的 `error.code` 按下表取值；`error.data` 里写明错误分类�
 | 每条消息的内容块 | 200 个 |
 | 格式正文、卡片 | 沿用 hhh-im 现有的节点数、深度预算 |
 | 单块文字 | 64 KiB |
+| `agentAttribution.name` | 512 个 UTF-8 字节，无控制字符、非空白 |
+| `agentAttribution.avatar` | 完整 data URL 24 KiB；坏头像回退默认头像，不丢正文 |
 | 编号 | 256 字节，不含控制字符 |
 | 资源的一段 | 1 MiB，而且不超过请求的 `length` |
 | 资源总长 | 不超过 `total`；图片、头像还要不超过 hhh-im 现有的上限 |
@@ -683,6 +735,7 @@ JSON-RPC 的 `error.code` 按下表取值；`error.data` 里写明错误分类�
 | 一次 `messages/retranslate` | 100 条 |
 | 一次 `messages/maintain` | 100 条，请求参数及结果各不超过 2 MiB；仍受 4 MiB JSON-RPC 帧上限约束 |
 | 日志行、`log/write` 的 `message` | 截到 4 KiB |
+| 一条 `perf/report`（v32） | 64 KiB；区间至多 256 个；计数与分布合计至多 128 个；名字至多 128 字；`intervalMs` 至少 500。超出整条丢弃并计数，不按协议错误处理 |
 | 登录方式（v12） | 至多 8 种；每段文字（叫法、说明、灰字、链接文字）至多 200 字 |
 | 登录时填的每个值、回调地址（v12） | 8 KiB |
 | `session/notice`（v12） | 至多 20 条，每条至多 200 字（超出的那条不显示） |
@@ -747,7 +800,9 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 10. v12 的新声明（没声明的跳过）：`userAdjustable`、`editsByContent` 的取值宿主认得出；`retranslateRules` 名字不重复；`emoji.textPattern` 能编译、有一个括号；`logoInk` 是合法的外框；`loginMethods` 的类型认得出、编号不重复、不超过 8 种，`callbackPath` 在这个 IM 自己的 `/hhh-friend-im/<平台编号>/` 下面；声明了 `conversations.recentActivity` 就要能回合法结果，声明了 `session.renew` 就要能答。
 11. v13 的新声明（没声明的跳过）：`actions` 的位置认得出、编号合规不重复、文字不超长、不超过 16 项；声明了账号级操作、登录着时 `actions/start` 要回流程编号；声明了 `host` 登录方式时提示只有宿主允许的（带官方签名的）程序能用。
 12. v15：声明了 `people.get` 时，问一个不存在的编号（声明了 `people.bots` 时人与机器人各一个），结果读得懂、同一个编号不会既在 `found` 又在 `missing`；`people.bots` 要先声明 `people.get`、`people.batchMax` 在 1–2000 之间（随能力组合一起查）。
-13. v35：声明了 `account.hostAvatar` 时交一张 1×1 的 PNG 样图，程序 10 秒内回成功；交头像会改本人头像、发给别人，算写操作，同发送一样需要 `--allow-send`（没给时跳过）。
+13. v31（没声明的跳过）：`emoji.textTemplate` 合写法规则；声明了 `reactions.catalog` 时读一次目录：同时声明了 `textPattern` 的，能写进文字的每个表情按写法写出来，`textPattern` 要整段认出、认出的名字或编号（按占位）对得回这个表情；分类的 `icon` 要在宿主图标库里。没登录读不到目录时跳过。
+14. v35：声明了 `account.hostAvatar` 时交一张 1×1 的 PNG 样图，程序 10 秒内回成功；交头像会改本人头像、发给别人，算写操作，同发送一样需要 `--allow-send`（没给时跳过）。
+15. v32：声明了 `perf` 时，`perf/start`（间隔 500 毫秒）之后收到至少一条合规的 `perf/report`（会话编号对、不超上限、不比间隔密），`perf/stop` 之后不再收到。
 
 `--mock` 要求程序支持不联网的模拟模式（见实现范式 §9）；`--live --read-only` 用真实账号，只做读取。
 
@@ -823,6 +878,8 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 
 ## 变更记录
 
+- 2026-10-22：新增可选 `AgentAttribution`、发送参数和消息字段、独立收发能力声明、容错与体积预算；`hhh-im-check --allow-send` 对声明发送署名的插件检查回包保留。协议主版本保持 1；实际插件适配与 SDK 发布独立进行。
+
 - 2026-10-04：v1 草案。补入 `log/write`（结构化日志）、消息 `raw` 原始数据与 `messages/retranslate`（可重新翻译）、`history=none` 平台存全部会话并走发现路径、上传即发送的平台说明、信任边界措辞纠正。
 - 2026-10-10（契约 v12，全部为可选的加法，主版本仍是 1）：会话发现（`discovery`、`conversations/recentActivity`、能力 `conversations.recentActivity`、`readDefaults.discover`）；读取与下载的数放开数值范围、`reads` 不再必填、`userAdjustable`；`editsByContent`；`retranslateRules`；`session/notice` 与 `Account.tenant` 的显示、`reactions/list` 缺权限时的 `userMessage`；登录方式 `loginMethods`、`login/start` 的 `{method, values, callbackUrl, state}`、`login/callback`；续期 `credential/save.renewAtMs`、`session/renew`、能力 `session.renew`、`session/open.credentialReadOnly`；`emoji.unlisted.guess`、`emoji.textPattern`、`emoji.whiteBackground`；清单 `logoStyle`、`logoInk`；`actions.edit.perMessage` 与消息 `editDraft`；`thread.copy`；保留编号与交接（`session/open.legacy`、`adoptedSettings`、附录 D）；§5.1“刻意不设”删去“不猜表情图”“不比内容认编辑”两项；§14 新预算；§17 新检查。
 - 2026-10-11（契约 v14，全部为可选的加法，主版本仍是 1）：编号种类 `idType`（账号、发送者、人员、提及与格式正文、卡片里的人）；格式正文与卡片里的人与资源宿主照 §7.6、附录 B 的写法收；读取结果可带 `platformRequests`；`loginMethods` 的 `callbackPath` 可写相对路径、`relay` 可写 `defaultValue`、`ownApp` 可写 `secretHelp`；`mention` 块可带 `kind`；`avatarIdentity`；表情的肤色版本（`tone`、`toneOf`）与目录的 `tones`，以及目录的 `categories`，宿主照收（以前丢掉）；`emoji.unlisted.guessPattern`；宿主照声明处理 `conversationNouns`、`emoji.namePattern`、`unlisted` 的占位；平台编号只由宿主定（协议包不再推）。
@@ -830,4 +887,6 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 - 2026-10-12（契约 v15，可选的加法，主版本仍是 1）：能力 `people.bots` 与 `people/get` 的 `bots`（按编号读机器人与应用）、`people.batchMax`（一次读人的上限）；宿主照 `people/get` 的结果办——只把 `missing` 记成“没有”，两边都没有的下次再读（以前没返回的一律记“没有”）；提及所有人可带平台的叫法（`mention` 的 `name`，内容块与格式正文里都是）；会话发现的一项可带群与频道的资料（`conversation`）；协议包的插件运行时（`runtime` 部件）与格式正文、卡片的类型（`content` 模块）。
 - 2026-10-16（契约 v19，可选的加法，主版本仍是 1）：`action/finished` 的 `removeFromList`（会话级操作做完后让会话离开宿主的列表，等同取消关注；不认识它的旧宿主只关对话框）。
 - 2026-10-21（hhh-im client 契约 v37，主版本仍是 1）：声明了 `discovery`、没有 `conversations.recentActivity` 但能列会话与读消息的程序，由宿主逐会话限频发现会话（原先这种声明不生效）；程序不用新增方法。
+- 2026-10-22（契约 v31，全部为可选的加法，主版本仍是 1）：表情写进文字的写法 `emoji.textTemplate`（宿主据此给输入框的表情按钮）、`textPattern` 认出的是名字还是编号跟写法一致；表情的 `inText`；目录分类的 `icon`；§17 新检查。
 - 2026-10-22（契约 v35，可选的加法，主版本仍是 1）：能力 `account.hostAvatar` 与宿主→程序请求 `account/avatar {avatar}`（本机用户头像：PNG / JPEG、边长 256 与 256 KiB 以内，§6.8）；`hostAccount.avatarUrl` 宿主不再填；§14 新预算；§17 新检查（需要 `--allow-send`）。
+- 2026-10-22（契约 v32，可选的加法，主版本仍是 1）：能力 `perf`、`perf/start` / `perf/stop` 请求与 `perf/report` 通知（§11.6）、自报上限（§14）、自检第 15 项；SDK `runtime` 自动声明并上报。

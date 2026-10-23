@@ -41,7 +41,8 @@ pub struct Manifest {
     /// 更新来源：宿主只从这里检查、下载新版本；不写就没有更新来源。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<crate::release::Source>,
-    /// 需要的最低宿主（HHH）版本，`主.次.修订`。
+    /// 宿主需要的最低 IM SDK 版本（`主.次.修订`，见 [`crate::SDK_VERSION`]）：打包工具按插件编进去的 SDK 自动写进包里的
+    /// 清单；宿主的 SDK 低于它就不装、不启动。不写的（老版本、开发时直接用文件夹装的）按兼容处理。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_host: Option<String>,
     /// 标志的画法（契约 provider-protocol v12 缺口 10）：`mark` 是透明底的标志图形、宿主垫自己的底；`icon`（默认）是
@@ -422,13 +423,95 @@ pub struct EmojiRules {
     pub name_pattern: Option<String>,
     /// 目录外的表情怎么显示。
     pub unlisted: UnlistedEmoji,
-    /// 正文里表情的写法（JavaScript 正则，第一个括号是表情名，如 `\[([^\[\]\r\n]{1,12})\]`）：宿主把正文里这样写的换成表情图；
-    /// 不写就不换（契约 provider-protocol v12 缺口 9）。
+    /// 正文里表情的写法（JavaScript 正则，如 `\[([^\[\]\r\n]{1,12})\]`）：宿主把正文里这样写的换成表情图；
+    /// 不写就不换（契约 provider-protocol v12 缺口 9）。第一个括号认出的是 [`Self::text_template`] 里占位的那一项：
+    /// 写法用 `{type}` 时是表情编号，用 `{name}` 或没声明写法时是名字（v31）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_pattern: Option<String>,
     /// 表情图是白底的：宿主显示前抠成透明（深色主题下不露白底）。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub white_background: bool,
+    /// 表情写进文字的写法（v31）：恰好一个占位 `{name}`（目录里的名字）或 `{type}`（表情编号），如 `[{name}]`、
+    /// `:{type}:`；宿主据此把面板里点的表情插进输入框。不写就没有输入框的表情按钮。格式见 [`TextTemplate::parse`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_template: Option<String>,
+}
+
+/// 写法里的占位：填名字还是填编号（v31）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateSlot {
+    /// `{name}`：目录里的名字。
+    Name,
+    /// `{type}`：表情编号。
+    Type,
+}
+
+/// 读懂了的“表情写进文字的写法”（[`EmojiRules::text_template`]，v31）：占位前后的文字与占位填什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextTemplate {
+    prefix: String,
+    slot: TemplateSlot,
+    suffix: String,
+}
+
+impl TextTemplate {
+    /// 按协议的规则读写法：恰好一个占位（`{name}` 或 `{type}`），不含换行与控制字符，去掉占位后至多
+    /// [`crate::budget::TEXT_TEMPLATE_AFFIX_MAX_CHARS`] 个字符。不合要求时给出原因。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hhh_im_protocol::platform::{TemplateSlot, TextTemplate};
+    /// let feishu = TextTemplate::parse("[{name}]").unwrap();
+    /// assert_eq!(feishu.slot(), TemplateSlot::Name);
+    /// assert_eq!(feishu.write("赞"), "[赞]");
+    /// assert_eq!(TextTemplate::parse(":{type}:").unwrap().write("wave::skin-tone-3"), ":wave::skin-tone-3:");
+    /// assert!(TextTemplate::parse("[{name}{type}]").is_err());
+    /// assert!(TextTemplate::parse("[赞]").is_err());
+    /// ```
+    pub fn parse(template: &str) -> Result<Self, String> {
+        if template.chars().any(char::is_control) {
+            return Err("写法里不能有换行或控制字符".into());
+        }
+        let found: Vec<(usize, TemplateSlot, &str)> = [
+            ("{name}", TemplateSlot::Name),
+            ("{type}", TemplateSlot::Type),
+        ]
+        .into_iter()
+        .flat_map(|(mark, slot)| {
+            template
+                .match_indices(mark)
+                .map(move |(at, mark)| (at, slot, mark))
+        })
+        .collect();
+        let [(at, slot, mark)] = found[..] else {
+            return Err("写法要恰好有一个占位：{name} 或 {type}".into());
+        };
+        let (prefix, suffix) = (&template[..at], &template[at + mark.len()..]);
+        if prefix.chars().count() + suffix.chars().count()
+            > crate::budget::TEXT_TEMPLATE_AFFIX_MAX_CHARS
+        {
+            return Err(format!(
+                "去掉占位后至多 {} 个字符",
+                crate::budget::TEXT_TEMPLATE_AFFIX_MAX_CHARS
+            ));
+        }
+        Ok(Self {
+            prefix: prefix.to_owned(),
+            slot,
+            suffix: suffix.to_owned(),
+        })
+    }
+
+    /// 占位填名字还是编号。
+    pub fn slot(&self) -> TemplateSlot {
+        self.slot
+    }
+
+    /// 把名字或编号（按 [`Self::slot`]）写成文字。
+    pub fn write(&self, value: &str) -> String {
+        format!("{}{value}{}", self.prefix, self.suffix)
+    }
 }
 
 /// 头像键里的身份（v14，可选）：同一个头像每次给的键不一样（如换了 CDN 主机）时，宿主靠它认出没变——资料不算变了、
@@ -570,6 +653,9 @@ impl PlatformDesc {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
+    /// 是否能跨账号保存／读取伙伴代发署名；旧插件不声明则全部关闭。
+    #[serde(default, skip_serializing_if = "AgentAttributionCaps::is_empty")]
+    pub agent_attribution: AgentAttributionCaps,
     /// 会话能力。
     #[serde(default)]
     pub conversations: ConversationCaps,
@@ -606,6 +692,10 @@ pub struct Capabilities {
     /// 会话（账号）能力。
     #[serde(default, skip_serializing_if = "SessionCaps::is_empty")]
     pub session: SessionCaps,
+    /// 剖析开着时能自报内部耗时（`perf/start` / `perf/report` / `perf/stop`，契约 provider-protocol v32）。
+    /// 用运行时（`runtime::serve_*`）的插件由运行时自动声明；不声明的插件宿主不发任何 `perf/*`。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub perf: bool,
     /// 本人账号资料能力（契约 provider-protocol v35）。
     #[serde(default, skip_serializing_if = "AccountCaps::is_empty")]
     pub account: AccountCaps,
@@ -623,6 +713,24 @@ pub struct AccountCaps {
 impl AccountCaps {
     fn is_empty(&self) -> bool {
         !self.host_avatar
+    }
+}
+
+/// 跨账号的伙伴署名能力；声明发送即承诺接收方能经平台读回相同信息。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAttributionCaps {
+    /// 发送时能将独立署名保存到接收账号可读取的位置。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub send: bool,
+    /// 能从历史、补读或推送还原伙伴署名。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub receive: bool,
+}
+
+impl AgentAttributionCaps {
+    fn is_empty(&self) -> bool {
+        !self.send && !self.receive
     }
 }
 
@@ -886,6 +994,14 @@ impl Capabilities {
     /// # Errors
     /// 组合不自洽时返回一句中文说明。
     pub fn check_consistent(&self, history: HistoryMode) -> Result<(), String> {
+        if self.agent_attribution.send && !self.send.as_ref().is_some_and(|send| send.text) {
+            return Err("声明 agentAttribution.send 时必须能发送文字".into());
+        }
+        if self.agent_attribution.receive
+            && !(self.messages.list || self.messages.get || self.events.messages)
+        {
+            return Err("声明 agentAttribution.receive 时必须能读取或接收消息".into());
+        }
         match history {
             HistoryMode::Server if !self.messages.list => {
                 return Err("history=server 必须声明 messages.list".into());
@@ -968,6 +1084,40 @@ mod tests {
             platform.check_maintenance(&caps).is_err(),
             "重读和重译不能共用完成标记"
         );
+    }
+
+    // 契约 provider-protocol v31：表情写进文字的写法可选、原样往返；格式按规则读，不合要求的给出原因。
+    #[test]
+    fn v31_text_template_is_optional_and_parsed_by_the_rules() {
+        use serde_json::json;
+        let rules: EmojiRules =
+            serde_json::from_value(json!({ "unlisted": { "placeholderLabel": "表情" } })).unwrap();
+        assert!(rules.text_template.is_none());
+        let declared = json!({ "unlisted": { "placeholderLabel": "表情" }, "textPattern": ":([^:\\s]+):", "textTemplate": ":{type}:" });
+        let rules: EmojiRules = serde_json::from_value(declared.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&rules).unwrap(), declared, "原样往返");
+
+        let slack = TextTemplate::parse(":{type}:").unwrap();
+        assert_eq!(
+            (slack.slot(), slack.write("+1")),
+            (TemplateSlot::Type, ":+1:".to_owned())
+        );
+        let bare = TextTemplate::parse("{name}").unwrap();
+        assert_eq!(bare.write("赞"), "赞", "占位前后可以没有字");
+        assert!(
+            TextTemplate::parse("<<<<<<<<{name}>>>>>>>>").is_ok(),
+            "前后合计 16 个字符可以"
+        );
+        for (bad, why) in [
+            ("[赞]", "没有占位"),
+            ("{name}{name}", "两个占位"),
+            ("[{name}|{type}]", "两种占位"),
+            ("[{name}]\n", "换行"),
+            ("<<<<<<<<<{name}>>>>>>>>", "前后合计超过 16 个字符"),
+            ("[{Name}]", "占位大小写不对"),
+        ] {
+            assert!(TextTemplate::parse(bad).is_err(), "{why}：{bad}");
+        }
     }
 
     // 契约 provider-protocol v14：头像身份、猜图范围都可选；不写时读成空、写回不多出键，写了原样往返。

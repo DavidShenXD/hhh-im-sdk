@@ -145,6 +145,8 @@ impl Uploads {
             return Err(error(ErrorKind::LimitExceeded, "上传的内容比说好的长。"));
         }
         upload.data.extend_from_slice(&bytes);
+        // 剖析开着时数收到了多少字节（契约 provider-protocol v32 §4）。
+        super::perf::count_current(super::perf::UPLOAD_BYTES, bytes.len() as u64);
         Ok(json!({}))
     }
 

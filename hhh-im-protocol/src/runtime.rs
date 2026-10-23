@@ -9,6 +9,8 @@
 //! - 资源分段（[`Segments`]）：宿主一段一段要资源时，同一个资源顺着读复用同一条读流。
 //! - 上传攒齐（[`Uploads`]）：`uploads/begin`、`chunk`、`finish` 攒齐、核对长度与 SHA-256。
 //! - 请求计数（[`metering`]）：一次宿主调用里向平台发了几次请求，运行时随结果报给宿主（`platformRequests`）。
+//! - 性能自报（契约 provider-protocol v32）：替插件声明 `perf`；宿主剖析开着时记每个请求的排队与处理耗时、平台请求、
+//!   等待放行、分段与上传字节，每个间隔发一条 `perf/report`。插件代码不用改。
 //!
 //! 插件实现 [`Plugin`]：收到一个请求怎么办（方法名与参数），通知怎么办（可不管）。
 //!
@@ -45,6 +47,7 @@
 mod host;
 mod log;
 pub mod metering;
+mod perf;
 mod segments;
 mod uploads;
 #[cfg(target_os = "wasi")]
@@ -261,8 +264,22 @@ fn receive<P: Plugin>(
         tokio::spawn(async move { plugin.notification(method, params, host).await });
         return;
     };
+    // 性能自报的开与关由运行时自己回，不交给插件（契约 provider-protocol v32）。
+    if method == crate::Method::PerfStart.as_str() || method == crate::Method::PerfStop.as_str() {
+        host.respond(id, perf::handle(host, &method, params));
+        return;
+    }
     let key = id.to_string();
     let permit = params.pointer("/_meta/readPermit").cloned();
+    let initialize = method == crate::Method::Initialize.as_str();
+    // 剖析开着时才留方法名（记排队与处理耗时用）；关着时只多这一次原子读取。
+    let probed = host.perf().active().then(|| {
+        (
+            host.perf().clone(),
+            method.clone(),
+            std::time::Instant::now(),
+        )
+    });
     let call = Call {
         id: id.clone(),
         method,
@@ -273,10 +290,35 @@ fn receive<P: Plugin>(
     // 先拿着任务表再开任务：任务做完删自己那一项时，表里一定已经记上了。
     let mut guard = tasks.lock().expect("任务表锁中毒");
     let task = tokio::spawn(async move {
-        let (reply, sent) =
-            metering::counted_with_permit(plugin.request(call), host_for_task.clone(), permit)
-                .await;
-        if let Reply::Result(result) = reply {
+        let began = std::time::Instant::now();
+        if let Some((recorder, method, received)) = &probed {
+            recorder.time(
+                &format!("{} · {method}", perf::QUEUE),
+                *received,
+                began - *received,
+            );
+        }
+        let recorder = probed.as_ref().map(|(recorder, ..)| recorder.clone());
+        let (reply, sent) = perf::scoped(
+            recorder,
+            metering::counted_with_permit(plugin.request(call), host_for_task.clone(), permit),
+        )
+        .await;
+        if let Some((recorder, method, _)) = &probed {
+            recorder.time(
+                &format!("{} · {method}", perf::HANDLE),
+                began,
+                began.elapsed(),
+            );
+            recorder.count(
+                &format!("{} · {method}", perf::PLATFORM_REQUESTS),
+                u64::from(sent),
+            );
+        }
+        if let Reply::Result(mut result) = reply {
+            if initialize && let Ok(value) = &mut result {
+                perf::declare(value);
+            }
             host_for_task.respond(id.clone(), with_platform_requests(result, sent));
         }
         table.lock().expect("任务表锁中毒").remove(&id.to_string());
