@@ -954,6 +954,23 @@ pub enum LoginStep {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         links: Vec<StepLink>,
     },
+    /// 登录窗口（契约 provider-protocol v36）：宿主开一个无痕窗口显示 `url`（平台自己的登录页），页面要跳到 `capture`
+    /// 里任一开头时截下、关窗，用 `login/callback {flowId, url}` 把完整地址交给插件（每一步至多一次）。规则见
+    /// [`crate::login_window`]；打不开这种窗口的宿主（网页版）只写明要到桌面版完成。
+    LoginWindow {
+        /// 起始网址（https，或本机回环 http）。
+        url: String,
+        /// 按钮文字：点了把窗口叫到前面，窗口关了就重新打开。
+        label: String,
+        /// 要截下的跳转开头，1 到 [`crate::budget::LOGIN_WINDOW_CAPTURES_MAX`] 项。
+        capture: Vec<String>,
+        /// 插件声明的提示。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<LoginNote>,
+        /// 另一种做法。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links: Vec<StepLink>,
+    },
 }
 
 /// 一步里“另一种做法”（v13）：按钮下方居中的文字按钮，点了宿主发 `step/choose {choice: id}`。
@@ -1241,6 +1258,23 @@ pub fn step_problem(step: &LoginStep) -> Option<&'static str> {
                 && sections.len() <= STEP_SECTIONS_MAX
                 && sections.iter().all(|s| filled(&s.title) && filled(&s.text))
                 && common_ok(links, cancel_label, cancel_choice)
+        }
+        LoginStep::LoginWindow {
+            url,
+            label,
+            capture,
+            links,
+            ..
+        } => {
+            if !crate::login_window::start_url_ok(url) {
+                return Some("登录窗口的起始网址要是 https，或本机回环地址的 http");
+            }
+            if !crate::login_window::captures_ok(capture) {
+                return Some(
+                    "登录窗口要截的跳转开头要有 1 到 4 个，每个是自定义协议的 <协议>:// 或带路径的 https 开头",
+                );
+            }
+            filled(label) && links_ok(links)
         }
     };
     (!ok).then_some("这一步的文字、行或按钮超出上限，或编号空着、重复")
@@ -2838,6 +2872,80 @@ mod tests {
     }
 
     // 契约 provider-protocol v13 §14：超出上限、编号空着或重复的一步不合要求。
+    #[test]
+    fn v36_login_window_round_trips_and_omits_empty_optionals() {
+        use serde_json::json;
+        let shape = json!({ "kind": "loginWindow", "url": "https://xd.slack.com/sso/saml/start",
+            "label": "打开 Slack 登录窗口", "capture": ["slack://", "https://app.slack.com/t/"] });
+        let step: LoginStep = serde_json::from_value(shape.clone()).unwrap();
+        let LoginStep::LoginWindow {
+            url,
+            label,
+            capture,
+            note,
+            links,
+        } = &step
+        else {
+            panic!("{step:?}")
+        };
+        assert_eq!(url, "https://xd.slack.com/sso/saml/start");
+        assert_eq!(label, "打开 Slack 登录窗口");
+        assert_eq!(capture.len(), 2);
+        assert!(note.is_none() && links.is_empty());
+        assert_eq!(serde_json::to_value(&step).unwrap(), shape);
+        assert_eq!(step_problem(&step), None);
+        // 带提示与另一种做法也照原样往返。
+        let full = json!({ "kind": "loginWindow", "url": "http://127.0.0.1:9/x", "label": "打开",
+            "capture": ["hhh-sample://"], "note": { "text": "用公司账号", "tone": "info" },
+            "links": [{ "id": "password", "label": "用密码登录" }] });
+        let step: LoginStep = serde_json::from_value(full.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&step).unwrap(), full);
+        // 原有步骤的写法不变。
+        let open = json!({ "kind": "openUrl", "url": "https://a.test/x", "label": "打开" });
+        let step: LoginStep = serde_json::from_value(open.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&step).unwrap(), open);
+    }
+
+    #[test]
+    fn v36_bad_login_windows_are_refused_with_the_reason() {
+        use crate::budget::{LOGIN_WINDOW_CAPTURES_MAX, STEP_PIECE_MAX_CHARS};
+        use serde_json::json;
+        let check =
+            |v: serde_json::Value| step_problem(&serde_json::from_value::<LoginStep>(v).unwrap());
+        let good = |capture: serde_json::Value| json!({ "kind": "loginWindow", "url": "https://a.test/s", "label": "打开", "capture": capture });
+        assert_eq!(check(good(json!(["a://"]))), None);
+        assert_eq!(
+            check(good(json!(vec!["a://"; LOGIN_WINDOW_CAPTURES_MAX]))),
+            None
+        );
+        for bad_url in [
+            "http://a.test/s",
+            "file:///C:/x",
+            "javascript:alert(1)",
+            "slack://x",
+        ] {
+            let reason = check(
+                json!({ "kind": "loginWindow", "url": bad_url, "label": "打开", "capture": ["a://"] }),
+            );
+            assert!(reason.is_some_and(|r| r.contains("起始网址")), "{bad_url}");
+        }
+        for bad in [
+            json!([]),
+            json!(vec!["a://"; LOGIN_WINDOW_CAPTURES_MAX + 1]),
+            json!(["https://a.test/"]),
+            json!(["http://a.test/x"]),
+            json!(["file:///"]),
+            json!(["javascript://x"]),
+            json!([""]),
+            json!([format!("a://{}", "x".repeat(200))]),
+        ] {
+            let reason = check(good(bad.clone()));
+            assert!(reason.is_some_and(|r| r.contains("跳转开头")), "{bad}");
+        }
+        assert!(check(json!({ "kind": "loginWindow", "url": "https://a.test/s", "label": " ", "capture": ["a://"] })).is_some());
+        assert!(check(json!({ "kind": "loginWindow", "url": "https://a.test/s", "label": "字".repeat(STEP_PIECE_MAX_CHARS + 1), "capture": ["a://"] })).is_some());
+    }
+
     #[test]
     fn v13_steps_over_the_limits_are_refused() {
         use crate::budget::{

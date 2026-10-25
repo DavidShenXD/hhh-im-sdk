@@ -1,8 +1,13 @@
 //! 示例 IM：把契约 provider-protocol v12、v13 的新声明与新方法都用上的演示插件，验收与插件作者参照用。
 //!
-//! - 两种登录方式：通过中继登录、使用自己的应用（声明本机回调路径）。插件自带一个本机回环的假授权页：登录时推“打开登录页”
-//!   一步，页上点“同意”——中继方式由插件自己完成登录；自己的应用方式带着 `code`、`state` 跳回宿主给的回调地址，宿主经
-//!   `login/callback` 交回来，核对 `state` 后完成。存凭据时带 `renewAtMs`（60 秒后），宿主到时叫 `session/renew`。
+//! - 三种登录方式：通过中继登录、使用自己的应用（声明本机回调路径）、在登录窗口里登录（v36）。插件自带一个本机回环的假授权页：
+//!   前两种推“打开登录页”一步，页上点“同意”——中继方式由插件自己完成登录；自己的应用方式带着 `code`、`state` 跳回宿主给的
+//!   回调地址，宿主经 `login/callback` 交回来，核对 `state` 后完成。登录窗口方式推“登录窗口”一步（起始网址是假登录页
+//!   `/window`、要截的开头 `hhh-sample://`），页上点“完成登录”跳到 `hhh-sample://done?state=…&code=…`，宿主截下、经
+//!   `login/callback` 交回来；链接对不上这次登录或没有登录码时 `login/failed` 说原因。页上另有一个 `other-app://` 链接（宿主
+//!   应当拦下）。参数 `--login-window-url <网址>` 或工作目录里的 `login-window-url` 写了网址就拿它当起始网址（看真实网页在窗口里的样子），`login-window-bad-capture`
+//!   在时（或带参数 `--bad-capture`）故意声明不合格的开头（宿主与 `hhh-im-check --login window` 都应拒绝）。存凭据时带 `renewAtMs`（60 秒后），宿主到时
+//!   叫 `session/renew`。
 //! - 会话发现（`conversations/recentActivity`）、开放读取频率与“每分钟最多读几次”（默认 120）、按内容认编辑、正文表情写法
 //!   `{名字}` 与白底表情图、每条消息自己说能不能编辑（`editDraft`）、一对话题副本、按规则名重译、续期、账号的工作区。
 //! - 平台是 `history=server`：宿主按读取频率来读（`messages/list`），每次读都在标准错误里写一行“距上次 N 秒”，看读取间隔用。
@@ -140,11 +145,16 @@ type Out = Arc<Mutex<std::io::Stdout>>;
 /// 插件发给宿主、正在等回复的请求：编号 → 收回复的一头（续期要等凭据存好再回宿主）。
 type Waiting = Arc<Mutex<BTreeMap<i64, std::sync::mpsc::Sender<RpcMessage>>>>;
 
-/// 一次正在进行的登录：宿主给的 `state` → 流程编号与回调地址（自己的应用方式才有）。
+/// 一次正在进行的登录：宿主给的 `state` → 流程编号与回调地址（自己的应用方式才有）；登录窗口方式（v36）记下是它。
 struct Flow {
     flow_id: String,
     callback: Option<String>,
+    window: bool,
 }
+
+/// 登录窗口方式（契约 provider-protocol v36）的编号与要截的跳转开头；假登录页上“完成登录”跳到这个开头的链接。
+const WINDOW_METHOD: &str = "window";
+const WINDOW_CAPTURE: &str = "hhh-sample://";
 
 /// 用宿主账号登录声明成什么样（`--host`、`--host-extra`）。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -270,6 +280,10 @@ struct State {
     callback_path: Option<String>,
     /// 用宿主账号登录怎么声明（`--host`、`--host-extra`）。
     host: HostMethod,
+    /// `--bad-capture`：登录窗口一步故意声明不合格的开头（v36，自检工具与宿主应当拒绝）。
+    bad_capture: bool,
+    /// `--login-window-url <网址>`：登录窗口一步的起始网址换成它（看真实网页在窗口里的样子，v36）。
+    window_url: Option<String>,
     logged_in: bool,
     /// 当前账号（`session/open`、续期时从凭据里取回；交接时换成内置平台核验过的账号）。
     account: Value,
@@ -280,8 +294,8 @@ struct State {
     reactions: Vec<Value>,
     /// 每个会话上次被读的时间（标准错误里写读取间隔用）。
     last_read: BTreeMap<String, i64>,
-    /// 刚开始的登录要推的“打开登录页”一步（回复 `login/start` 之后推）。
-    pending_step: Option<(String, String)>,
+    /// 刚开始的登录要推的一步（“打开登录页”或“登录窗口”，回复 `login/start` 之后推）：流程编号与这一步。
+    pending_step: Option<(String, Value)>,
     /// 正在走的宿主账号登录或插件操作。
     active: Option<Active>,
     /// 回复宿主之后要做的事（读标准输入的那条线程在回复之后做）。
@@ -326,6 +340,8 @@ fn main() {
         plain: has("--plain"),
         callback_path: value_of("--callback-path"),
         host,
+        bad_capture: has("--bad-capture"),
+        window_url: value_of("--login-window-url"),
         logged_in: false,
         account: default_account(),
         flows: BTreeMap::new(),
@@ -423,12 +439,11 @@ fn main() {
             },
         );
         let pending = state.lock().unwrap().pending_step.take();
-        if let Some((flow_id, url)) = pending {
+        if let Some((flow_id, step)) = pending {
             notify(
                 &out,
                 "login/step",
-                json!({ "flowId": flow_id, "step": { "kind": "openUrl", "url": url, "label": "再打开一次",
-                    "note": { "text": "演示插件的假授权页：点“同意”就算登录成功。", "tone": "info" } } }),
+                json!({ "flowId": flow_id, "step": step }),
             );
         }
         let follow = std::mem::take(&mut state.lock().unwrap().follow);
@@ -591,6 +606,11 @@ fn initialize(state: &State) -> Value {
               "callbackHelp": "在示例开放平台的应用后台，把这个地址登记为重定向地址。",
               "createLink": { "label": "前往示例开放平台创建", "url": "https://open.example.com/app",
                               "after": "，创建后把 App ID 与 App Secret 填在下面。" } }));
+        // 登录窗口（v36）：直接登录，点“登录”后推“登录窗口”一步。
+        login_methods.push(
+            json!({ "id": WINDOW_METHOD, "kind": "direct", "label": "在登录窗口里登录",
+                                   "note": "在 HHH 打开的登录窗口里完成登录，不用自己创建应用。" }),
+        );
     }
     let mut result = json!({
         "protocolVersion": 1,
@@ -709,21 +729,46 @@ fn start_login(params: &Value, state: &Arc<Mutex<State>>, port: u16) -> Result<V
     let callback = (method == "own")
         .then(|| params["callbackUrl"].as_str().map(str::to_owned))
         .flatten();
-    state.pending_step = Some((
-        flow_id.clone(),
-        format!("http://127.0.0.1:{port}/authorize?state={}", encode(&key)),
-    ));
+    let window = method == WINDOW_METHOD;
+    let step = if window {
+        window_step(&key, port, state.bad_capture, state.window_url.clone())
+    } else {
+        json!({ "kind": "openUrl", "label": "再打开一次",
+            "url": format!("http://127.0.0.1:{port}/authorize?state={}", encode(&key)),
+            "note": { "text": "演示插件的假授权页：点“同意”就算登录成功。", "tone": "info" } })
+    };
+    state.pending_step = Some((flow_id.clone(), step));
     state.flows.insert(
         key,
         Flow {
             flow_id: flow_id.clone(),
             callback,
+            window,
         },
     );
     Ok(json!({ "flowId": flow_id }))
 }
 
-/// `login/callback`：宿主把回调地址交回来；`state` 与授权码对得上才算登录成功。
+/// 登录窗口一步（契约 provider-protocol v36）：起始网址是自带的假登录页（参数 `--login-window-url` 或工作目录里 `login-window-url` 写了网址就用它，
+/// 验收看真实网页在窗口里的样子用）；要截的开头是 `hhh-sample://`（有 `login-window-bad-capture` 时故意写成不合格的
+/// `https://example.com/`，演示宿主与自检工具拒绝；参数 `--bad-capture` 同样）。
+fn window_step(key: &str, port: u16, bad_capture: bool, given: Option<String>) -> Value {
+    let url = given
+        .or_else(|| std::fs::read_to_string("login-window-url").ok())
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{port}/window?state={}", encode(key)));
+    let capture = if bad_capture || std::path::Path::new("login-window-bad-capture").exists() {
+        "https://example.com/"
+    } else {
+        WINDOW_CAPTURE
+    };
+    json!({ "kind": "loginWindow", "url": url, "label": "打开登录窗口", "capture": [capture],
+        "note": { "text": "演示插件的假登录页：点“完成登录”就算登录成功。", "tone": "info" } })
+}
+
+/// `login/callback`：宿主把回调地址交回来（自己的应用方式的本机回调，或 v36 登录窗口截下的 `hhh-sample://` 链接）；
+/// `state` 与授权码对得上才算登录成功。登录窗口交回来的链接对不上这次登录或没有登录码时，这次登录失败并说原因。
 fn finish_callback(
     params: &Value,
     state: &Arc<Mutex<State>>,
@@ -732,25 +777,43 @@ fn finish_callback(
     waiting: &Waiting,
 ) -> Result<Value, RpcError> {
     let url = params["url"].as_str().unwrap_or("");
+    let flow_id = params["flowId"].as_str().unwrap_or("");
     let query = query_of(url);
     let given = query.get("state").cloned().unwrap_or_default();
-    let flow = {
+    let (flow, matched) = {
         let mut state = state.lock().unwrap();
         match state.flows.get(&given) {
-            Some(flow) if Some(flow.flow_id.as_str()) == params["flowId"].as_str() => {
-                state.flows.remove(&given)
+            Some(flow) if flow.flow_id == flow_id => (state.flows.remove(&given), true),
+            _ => {
+                // 登录窗口截下的链接带错了 state：按流程编号找到这次登录、结束它。
+                let key = state
+                    .flows
+                    .iter()
+                    .find(|(_, flow)| flow.window && flow.flow_id == flow_id)
+                    .map(|(key, _)| key.clone());
+                (key.and_then(|key| state.flows.remove(&key)), false)
             }
-            _ => None,
         }
     };
     let Some(flow) = flow else {
         return Err(error("invalidRequest", "回调对不上这次登录。"));
     };
-    if query.get("code").map(String::as_str) != Some(CODE) {
+    let problem = if !matched {
+        Some("登录窗口交回来的链接对不上这次登录。")
+    } else if query.get("code").map(String::as_str) != Some(CODE) {
+        Some(if flow.window {
+            "登录窗口交回来的链接里没有登录码。"
+        } else {
+            "示例开放平台没给授权码。"
+        })
+    } else {
+        None
+    };
+    if let Some(message) = problem {
         notify(
             out,
             "login/failed",
-            json!({ "flowId": flow.flow_id, "message": "示例开放平台没给授权码。", "retryable": true }),
+            json!({ "flowId": flow.flow_id, "message": message, "retryable": true }),
         );
         return Ok(json!({}));
     }
@@ -2248,6 +2311,19 @@ fn serve(
             .map(|f| (f.flow_id.clone(), f.callback.clone()))
     };
     let (status, headers, body) = match (path, flow) {
+        // 登录窗口方式（v36）的假登录页：“完成登录”跳到 `hhh-sample://`（宿主截下交回来），另有一个打开别的 App 的链接
+        // （宿主应当拦下，验收用）。
+        ("/window", Some(_)) => (
+            "200 OK",
+            String::new(),
+            format!(
+                "<!doctype html><meta charset=utf-8><title>示例 IM 登录</title><body style=\"font:16px system-ui;padding:40px\">\
+                 <h1>示例 IM 登录</h1><p>这是演示插件的假登录页。点“完成登录”就算登录成功。</p>\
+                 <p><a id=\"finish\" href=\"{WINDOW_CAPTURE}done?state={0}&code={CODE}\" style=\"padding:8px 16px;background:#3370ff;color:#fff;border-radius:6px;text-decoration:none\">完成登录</a></p>\
+                 <p><a id=\"other-app\" href=\"other-app://open?state={0}\">打开别的 App</a></p></body>",
+                encode(&key)
+            ),
+        ),
         ("/authorize", Some(_)) => (
             "200 OK",
             String::new(),

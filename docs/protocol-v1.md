@@ -262,6 +262,7 @@
 |---|---|---|
 | `qrCode` | `image`（PNG 的 base64，不超过 512 KiB）、`expiresAtMs`、`hint` | 二维码和倒计时。码过期后由程序自己换新码，再发一次这个步骤 |
 | `openUrl` | `url`（https，或本机回环地址的 http）、`label` | 一个“打开浏览器”按钮，不在页面里嵌入网页 |
+| `loginWindow`（v36） | `url`（同 `openUrl`）、`label`、`capture`（要截下的跳转开头，1–4 项） | 桌面版开一个无痕登录窗口显示 `url`，截到跳转后关窗、经 `login/callback` 交给程序；登录框里一颗把窗口叫到前面 / 重新打开的按钮（文字用 `label`）；网页版写明这一步要在桌面版完成。见本节末尾“登录窗口” |
 | `confirmOnDevice` | `message` | 等待提示，例如“请在手机上确认” |
 | `input` | `fields: [{id, label, secret, placeholder, pattern}]` | 一个表单。用户提交后，宿主调用 `login/submit {flowId, values}` |
 | `message` | `text`、`tone`（`info` / `warn`） | 一段说明文字 |
@@ -279,6 +280,12 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 - 需要浏览器授权回调（OAuth）的，有两种做法：程序自己在本机回环地址上监听，并把这个地址写进 `openUrl` 步骤里；或者（v12）在登录方式里声明 `callbackPath`，由宿主在本机地址上收（§6.1a）。
 - 程序必须在收到 `credential/save` 的成功回复之后，才能发 `login/finished`。
 - `openUrl` 一步到了，宿主自动打开它（桌面版交给系统默认浏览器，网页版新标签），登录框里的次按钮（文字用 `label`）能再打开一次（v12）；打开的登录页宿主不关，登录结束后由用户关（friend/im-auth-relay v8 起，此前桌面版在授权窗口里、结束后关窗）。
+- **登录窗口**（v36）：登录走完时平台跳到一个系统浏览器截不住的链接（如 `slack://…/magic-login-sso/<码>`，系统会把它交给对应的 App）时用这一步。
+  - `capture` 每项二选一：自定义协议的 `<协议>://…`（协议不能是 http、https、file、javascript、data、about、blob、ws、wss、ftp、view-source），或 https 开头且带地址与至少一段路径（如 `https://app.example.com/t/`，只到地址的不行）；每项至多 200 字。比较时协议名与地址（`://` 之后、第一个 `/` 之前）不分大小写，其余按字面前缀。`url` 不合规、`capture` 为空 / 超过 4 项 / 有不合格的项，这一步宿主不显示，这次流程按失败处理（同 v13 超出上限的步骤）。规则在协议包 `login_window` 模块（`start_url_ok`、`capture_ok`、`captured`），宿主、自检工具与程序共用。
+  - 桌面版宿主一到这一步就开窗（同一步只自动开一次），一次至多一个窗口；窗口无痕、与宿主自己的浏览数据隔离、关掉即清空；窗口里只放行 http/https，网页要开新窗口的在同一个窗口里打开，别的协议一律拦下；窗口没有任何宿主权限。页面要跳到对得上 `capture` 的地址时，宿主取消这次跳转、关窗，发 `login/callback {flowId, url}`（`url` 是完整地址，与 §6.1a 本机回调同一个方法），每一步至多一次。程序核对后照常以 `login/finished` 或 `login/failed` 结束；对不上这次登录的链接应以 `login/failed` 说明原因。
+  - 用户自己关了窗口不算取消：登录框写“登录窗口已关闭”，按钮重新打开（从 `url` 重来）。登录有了结局、程序推了别的步骤或新的 `loginWindow`、程序退出时，宿主关窗。
+  - 截取规则只在宿主，推给页面的那一步不带；`url` 与截下的地址不进日志。宿主不注册任何协议处理器、不改系统的默认打开方式。
+  - 宿主不告诉程序自己能不能开窗：网页版的登录框写明要到桌面版完成，只留取消。旧宿主读不懂这一步，这次登录会失败；用它的程序依赖含这一步的 SDK（`minHost` 由打包工具自动写），旧宿主装不上。
 
 ### 6.1a 登录方式（v12，可选）
 
@@ -746,6 +753,7 @@ JSON-RPC 的 `error.code` 按下表取值；`error.data` 里写明错误分类�
 | 操作（v13） | 至多 16 项；`label` 与提醒按钮的文字至多 20 字（多出的项、太长的不登记） |
 | 步骤（v13） | `showText.text` 至多 4096 字；列表至多 200 行、每行至多 4 颗按钮；`links` 至多 8 个；`sections` 至多 16 段；其余每段文字至多 200 字（超出的一步不显示、这次流程失败） |
 | `account/avatar` 交出的头像（v35，宿主自己守） | 边长 256 以内、256 KiB 以内，只用 PNG 或 JPEG |
+| 登录窗口一步（v36） | `capture` 1–4 项、每项至多 200 字；`label` 至多 200 字（不合规的一步不显示、这次流程失败） |
 
 宿主还会核对这几件事：
 - 结果里的会话编号和请求的一致。
@@ -774,7 +782,7 @@ JSON-RPC 的 `error.code` 按下表取值；`error.data` 里写明错误分类�
 HHH 提供一个命令行工具。第三方开发者用它检查自己的程序，HHH 的验收也用它：
 
 ```
-hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话编号>]
+hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话编号>] [--login <登录方式编号>]
 ```
 
 每一项检查都给出通过、失败或跳过，失败时写明原因：
@@ -803,6 +811,7 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 13. v31（没声明的跳过）：`emoji.textTemplate` 合写法规则；声明了 `reactions.catalog` 时读一次目录：同时声明了 `textPattern` 的，能写进文字的每个表情按写法写出来，`textPattern` 要整段认出、认出的名字或编号（按占位）对得回这个表情；分类的 `icon` 要在宿主图标库里。没登录读不到目录时跳过。
 14. v35：声明了 `account.hostAvatar` 时交一张 1×1 的 PNG 样图，程序 10 秒内回成功；交头像会改本人头像、发给别人，算写操作，同发送一样需要 `--allow-send`（没给时跳过）。
 15. v32：声明了 `perf` 时，`perf/start`（间隔 500 毫秒）之后收到至少一条合规的 `perf/report`（会话编号对、不超上限、不比间隔密），`perf/stop` 之后不再收到。
+16. v36：给了 `--login <方式>` 且没在线时，开始一次这种登录，5 秒内要推第一步，每一步宿主都认（读得出来、不超上限；`loginWindow` 的 `url` 与 `capture` 合规），然后取消这次登录。开始登录可能连平台，所以不给 `--login` 时跳过。
 
 `--mock` 要求程序支持不联网的模拟模式（见实现范式 §9）；`--live --read-only` 用真实账号，只做读取。
 
@@ -890,3 +899,4 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 - 2026-10-22（契约 v31，全部为可选的加法，主版本仍是 1）：表情写进文字的写法 `emoji.textTemplate`（宿主据此给输入框的表情按钮）、`textPattern` 认出的是名字还是编号跟写法一致；表情的 `inText`；目录分类的 `icon`；§17 新检查。
 - 2026-10-22（契约 v35，可选的加法，主版本仍是 1）：能力 `account.hostAvatar` 与宿主→程序请求 `account/avatar {avatar}`（本机用户头像：PNG / JPEG、边长 256 与 256 KiB 以内，§6.8）；`hostAccount.avatarUrl` 宿主不再填；§14 新预算；§17 新检查（需要 `--allow-send`）。
 - 2026-10-22（契约 v32，可选的加法，主版本仍是 1）：能力 `perf`、`perf/start` / `perf/stop` 请求与 `perf/report` 通知（§11.6）、自报上限（§14）、自检第 15 项；SDK `runtime` 自动声明并上报。
+- 2026-10-25（契约 v36，可选的加法，主版本仍是 1）：登录步骤 `loginWindow`（§6.1“登录窗口”：桌面版无痕登录窗口，截到 `capture` 开头的跳转经 `login/callback` 交给程序）；协议包 `login_window` 模块；§14 新预算；`hhh-im-check --login` 与自检第 16 项。

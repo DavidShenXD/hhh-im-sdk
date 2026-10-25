@@ -1,9 +1,11 @@
 //! `hhh-im-check`：拿一个插件把 HHH-IM-Protocol 的用例跑一遍（protocol-v1 §17）。
 //! 第三方开发者自测、HHH 验收都用它。
 //!
-//! 用法：`hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话编号>]`
+//! 用法：`hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话编号>] [--login <登录方式编号>]`
 //!
 //! 每项检查给出 通过 / 失败 / 跳过，失败写明原因。整体有失败时进程以非 0 退出。
+//! `--login` 只在给了时才开始一次登录（可能连平台，所以要显式给）：看插件推来的第一步合不合格（契约 provider-protocol v36
+//! 的登录窗口一步按协议包的规则核对起始网址与要截的开头），然后取消这次登录。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,12 +71,14 @@ struct Args {
     live: bool,
     read_only: bool,
     allow_send: Option<String>,
+    /// 要开始一次登录看第一步的登录方式编号（v36）。
+    login: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut a = std::env::args().skip(1);
     let manifest = a.next().ok_or(
-        "用法：hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话编号>]",
+        "用法：hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话编号>] [--login <登录方式编号>]",
     )?;
     let mut args = Args {
         manifest: PathBuf::from(manifest),
@@ -82,6 +86,7 @@ fn parse_args() -> Result<Args, String> {
         live: false,
         read_only: false,
         allow_send: None,
+        login: None,
     };
     while let Some(flag) = a.next() {
         match flag.as_str() {
@@ -90,6 +95,9 @@ fn parse_args() -> Result<Args, String> {
             "--read-only" => args.read_only = true,
             "--allow-send" => {
                 args.allow_send = Some(a.next().ok_or("--allow-send 后要带会话编号")?);
+            }
+            "--login" => {
+                args.login = Some(a.next().ok_or("--login 后要带登录方式编号")?);
             }
             other => return Err(format!("不认识的参数：{other}")),
         }
@@ -372,6 +380,14 @@ async fn run(args: Args) -> i32 {
 
     // 给推送一点时间到达。
     tokio::time::sleep(Duration::from_millis(300)).await;
+    check_login_start(
+        &conn,
+        &mut report,
+        &collected,
+        args.login.as_deref(),
+        online,
+    )
+    .await;
     check_v12_calls(&conn, &mut report, &caps, online).await;
     check_v13_calls(&conn, &mut report, &init, online).await;
     check_v31_calls(&conn, &mut report, &platform, &caps, online).await;
@@ -645,6 +661,71 @@ fn check_v13_declarations(report: &mut Report, init: &Value) {
 
 /// 契约 provider-protocol v13 的新方法：声明了操作就要能开始（`actions/start` 回流程编号），试完立刻取消。只有会话级
 /// 操作时要一个会话才能试，跳过。
+/// `--login <方式>`（契约 provider-protocol v36）：没在线时开始一次登录，等插件推第一步（至多 5 秒），取消这次登录，再按
+/// [`check_login_steps`] 核对收到的步骤。不给 `--login` 不开始登录（可能连平台）。
+async fn check_login_start(
+    conn: &Arc<Connection>,
+    report: &mut Report,
+    collected: &Arc<Mutex<Collected>>,
+    method: Option<&str>,
+    online: bool,
+) {
+    const NAME: &str = "登录步骤合格";
+    let Some(method) = method else {
+        report.skip(NAME, "没给 --login，不开始登录");
+        return;
+    };
+    if online {
+        report.skip(NAME, "已经在线，不开始登录");
+        return;
+    }
+    let flow = match call_t(
+        conn,
+        "login/start",
+        json!({ "method": method, "values": {} }),
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(v) => v["flowId"].as_str().unwrap_or_default().to_owned(),
+        Err(e) => {
+            report.fail(NAME, format!("login/start（{method}）：{e}"));
+            return;
+        }
+    };
+    let waited = tokio::time::timeout(Duration::from_secs(5), async {
+        while collected.lock().unwrap().login_steps.is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let _ = conn.notify("login/cancel", json!({ "flowId": flow })).await;
+    if waited.is_err() {
+        report.fail(NAME, format!("开始“{method}”登录后 5 秒内没推登录步骤"));
+        return;
+    }
+    let steps = collected.lock().unwrap().login_steps.clone();
+    check_login_steps(report, &steps);
+}
+
+/// 收到的每一步宿主都认（读得出来、不超上限；登录窗口一步的起始网址与要截的开头合规）。
+fn check_login_steps(report: &mut Report, steps: &[Value]) {
+    use hhh_im_protocol::method::{LoginStep, step_problem};
+    const NAME: &str = "登录步骤合格";
+    let problem = steps.iter().find_map(|raw| {
+        let kind = raw["kind"].as_str().unwrap_or("?").to_owned();
+        match serde_json::from_value::<LoginStep>(raw.clone()) {
+            Err(e) => Some(format!("“{kind}”一步读不出来：{e}")),
+            Ok(step) => step_problem(&step).map(|why| format!("“{kind}”一步：{why}")),
+        }
+    });
+    match (steps.is_empty(), problem) {
+        (true, _) => report.skip(NAME, "没收到登录步骤"),
+        (false, Some(why)) => report.fail(NAME, why),
+        (false, None) => report.pass(NAME),
+    }
+}
+
 async fn check_v13_calls(conn: &Arc<Connection>, report: &mut Report, init: &Value, online: bool) {
     use hhh_im_protocol::method::{ActionDecl, ActionScope, ActionsStartResult};
     let actions: Vec<ActionDecl> = init
@@ -1236,6 +1317,40 @@ mod v12_tests {
             .into_iter()
             .find(|(n, _)| n == name)
             .map_or("missing", |(_, s)| s)
+    }
+
+    // 契约 provider-protocol v36：登录步骤合格——合规的登录窗口一步通过，不合格的开头或起始网址失败，没收到步骤跳过。
+    #[test]
+    fn v36_login_steps_pass_fail_and_skip() {
+        let good = json!({ "kind": "loginWindow", "url": "http://127.0.0.1:9/window?state=s", "label": "打开登录窗口",
+            "capture": ["hhh-sample://"] });
+        let mut report = Report::new();
+        check_login_steps(&mut report, std::slice::from_ref(&good));
+        assert_eq!(status_of(&report, "登录步骤合格"), "pass");
+        let bad_capture = json!({ "kind": "loginWindow", "url": "https://a.test/s", "label": "打开", "capture": ["https://example.com/"] });
+        let mut report = Report::new();
+        check_login_steps(&mut report, &[good.clone(), bad_capture]);
+        assert_eq!(status_of(&report, "登录步骤合格"), "fail");
+        assert!(
+            report.rows[0].2.contains("跳转开头"),
+            "{}",
+            report.rows[0].2
+        );
+        let bad_url = json!({ "kind": "loginWindow", "url": "http://a.test/s", "label": "打开", "capture": ["a://"] });
+        let mut report = Report::new();
+        check_login_steps(&mut report, &[bad_url]);
+        assert!(
+            report.rows[0].2.contains("起始网址"),
+            "{}",
+            report.rows[0].2
+        );
+        let unreadable = json!({ "kind": "loginWindow", "url": "https://a.test/s" });
+        let mut report = Report::new();
+        check_login_steps(&mut report, &[unreadable]);
+        assert_eq!(status_of(&report, "登录步骤合格"), "fail");
+        let mut report = Report::new();
+        check_login_steps(&mut report, &[]);
+        assert_eq!(status_of(&report, "登录步骤合格"), "skip");
     }
 
     // 每项新检查一正一反（契约 provider-protocol v12）：没声明跳过，写对通过，写错失败。

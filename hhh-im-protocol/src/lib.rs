@@ -10,6 +10,7 @@
 //! - [`types`]：账号、会话、人员、消息、内容块、资源、表情等领域类型。
 //! - [`platform`]：平台说明、能力清单、设置项、插件清单。
 //! - [`method`]：方法名常量，以及每个方法的参数/结果类型。
+//! - [`login_window`]：“登录窗口”一步的起始网址、要截的跳转开头与截取判断（宿主、自检工具与插件共用）。
 //! - [`release`]：安装包的目标、更新来源、版本号与版本索引（发布与检查更新）。
 //! - [`transport`]（feature `transport`）：子进程 stdio 传输与 [`transport::ProviderTransport`] trait。
 //! - [`package`]（feature `package`）：安装包 `.hhhim` 的打包、读清单与解包。
@@ -18,6 +19,7 @@
 
 pub mod attribution;
 pub mod content;
+pub mod login_window;
 pub mod method;
 pub mod platform;
 pub mod release;
@@ -138,6 +140,10 @@ pub mod budget {
     pub const STEP_LINKS_MAX: usize = 8;
     /// 列表一行最多几颗按钮。
     pub const ROW_ACTIONS_MAX: usize = 4;
+    /// “登录窗口”一步最多几个要截的跳转开头（契约 provider-protocol v36）。
+    pub const LOGIN_WINDOW_CAPTURES_MAX: usize = 4;
+    /// 一个要截的跳转开头最多几个字（按字符数）。
+    pub const LOGIN_WINDOW_CAPTURE_MAX_CHARS: usize = 200;
     /// 确认一步最多几段带小标题的说明。
     pub const STEP_SECTIONS_MAX: usize = 16;
     /// 一次 `people/get` 问几个（`ids` 与 `bots` 合计）：程序没声明 `people.batchMax` 时（v15）。
