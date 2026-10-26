@@ -417,6 +417,44 @@ pub fn rich_block(children: Vec<RichNode>) -> Block {
     Block::Rich { root }
 }
 
+/// 若干块 → 要发出的格式正文（契约 provider-protocol v40），宿主交给插件的就是这个形状。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::content::{RichNode, rich_nodes, rich_outgoing};
+/// use hhh_im_protocol::Outgoing;
+/// let out = rich_outgoing(vec![RichNode::Paragraph {
+///     children: vec![RichNode::Strong { children: vec![RichNode::Text { value: "明早 9 点".into() }] }],
+/// }]);
+/// let Outgoing::Rich { root } = &out else { panic!() };
+/// assert_eq!(root["type"], "root");
+/// assert_eq!(rich_nodes(root).unwrap().len(), 1);
+/// ```
+pub fn rich_outgoing(children: Vec<RichNode>) -> crate::Outgoing {
+    let root = serde_json::to_value(Root {
+        kind: "root",
+        children: &children,
+    })
+    .unwrap_or_default();
+    crate::Outgoing::Rich { root }
+}
+
+/// 读出格式正文的块（插件收到 [`crate::Outgoing::Rich`] 或编辑原文时用）。
+///
+/// # Errors
+/// 根不是 `{"type":"root","children":[...]}`，或节点写法不对时返回说明。
+pub fn rich_nodes(root: &serde_json::Value) -> Result<Vec<RichNode>, String> {
+    if root.get("type").and_then(serde_json::Value::as_str) != Some("root") {
+        return Err("格式正文的根要是 {\"type\":\"root\"}".into());
+    }
+    let children = root
+        .get("children")
+        .cloned()
+        .ok_or_else(|| "格式正文的根缺 children".to_string())?;
+    serde_json::from_value(children).map_err(|error| format!("格式正文的节点写法不对：{error}"))
+}
+
 /// 一张卡片 → 卡片内容块。
 ///
 /// # Examples

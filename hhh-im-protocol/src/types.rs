@@ -429,6 +429,14 @@ pub enum Outgoing {
         /// 资源键。
         key: String,
     },
+    /// 格式正文（契约 provider-protocol v40）：`{"type":"root","children":[...]}`，节点同收消息的 [`Block::Rich`]
+    /// （protocol-v1 §7.6），用 [`crate::content::rich_outgoing`] 搭、[`crate::content::rich_nodes`] 读。
+    /// 宿主只交给在 `capabilities.richSend` 里声明了格式的插件，是这一条的全部内容，树里只有声明过的格式
+    /// （段落、文字、换行、提及、表情总可以有）；提及写成 `{"type":"mention","userId":…,"name":…}` 或 `everyone`。
+    Rich {
+        /// 语法树的根。
+        root: serde_json::Value,
+    },
 }
 
 /// 发送目标（protocol-v1 §10）。
@@ -580,6 +588,14 @@ pub const EMOJI_CATEGORY_ICONS: [&str; 9] = [
     rename_all_fields = "camelCase"
 )]
 pub enum Event {
+    /// 分组目录或成员发生变化；只标记失效，下一次读取仍走正常查询与限流。
+    ConversationGroupsChanged {
+        /// 目录有变化。
+        catalog: bool,
+        /// 受影响的组；为空表示所有组。
+        group_ids: Vec<String>,
+    },
+
     /// 新到或变了的消息（含编辑、撤回成标记、话题根变化）。
     Messages {
         /// 会话编号。

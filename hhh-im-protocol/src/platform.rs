@@ -653,6 +653,9 @@ impl PlatformDesc {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
+    /// 可选会话分组，与列群能力独立。
+    #[serde(default, skip_serializing_if = "crate::groups::GroupCaps::is_empty")]
+    pub conversation_groups: crate::groups::GroupCaps,
     /// 是否能跨账号保存／读取伙伴代发署名；旧插件不声明则全部关闭。
     #[serde(default, skip_serializing_if = "AgentAttributionCaps::is_empty")]
     pub agent_attribution: AgentAttributionCaps,
@@ -699,6 +702,74 @@ pub struct Capabilities {
     /// 本人账号资料能力（契约 provider-protocol v35）。
     #[serde(default, skip_serializing_if = "AccountCaps::is_empty")]
     pub account: AccountCaps,
+    /// 发送与编辑时能收的格式正文（契约 provider-protocol v40）；不写就只收文字（与以前一样）。
+    #[serde(default, skip_serializing_if = "RichSendCaps::is_empty")]
+    pub rich_send: RichSendCaps,
+}
+
+/// 能交给插件的格式（契约 provider-protocol v40），名字同格式正文的节点类型（protocol-v1 §7.6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RichFormat {
+    /// 粗体。
+    Strong,
+    /// 斜体。
+    Emphasis,
+    /// 下划线。
+    Underline,
+    /// 删除线。
+    Delete,
+    /// 行内代码。
+    InlineCode,
+    /// 链接。
+    Link,
+    /// 引用。
+    Blockquote,
+    /// 列表（有序、无序，可以嵌套）。
+    List,
+    /// 代码块。
+    Code,
+    /// 不认识的名字（更新的插件写的）：宿主忽略这一项。
+    #[serde(other)]
+    Unknown,
+}
+
+/// 发送与编辑时的格式正文（契约 provider-protocol v40）。
+///
+/// 声明了格式的插件，宿主在用户用了格式时交 [`crate::Outgoing::Rich`]（单独成一条的全部内容），树里只有这里声明过的格式；
+/// 段落、文字、换行、提及、表情不用声明，格式正文里总可以有。没用格式时照旧交文字与提及。
+///
+/// # Examples
+///
+/// ```
+/// use hhh_im_protocol::platform::{RichFormat, RichSendCaps};
+/// let caps: RichSendCaps = serde_json::from_str(r#"{"formats":["strong","list","sparkle"],"edit":true}"#).unwrap();
+/// assert!(caps.allows(RichFormat::Strong) && caps.allows(RichFormat::List));
+/// assert!(!caps.allows(RichFormat::Underline));
+/// assert!(!caps.allows(RichFormat::Unknown), "不认识的名字不算声明了什么");
+/// assert!(RichSendCaps::default().is_empty());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RichSendCaps {
+    /// 能发的格式；空就不收格式正文。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<RichFormat>,
+    /// 编辑时也收格式正文（要先能编辑）；这时消息的编辑原文 `editDraft` 也可以是格式正文。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edit: bool,
+}
+
+impl RichSendCaps {
+    /// 什么都没声明。
+    pub fn is_empty(&self) -> bool {
+        self.formats.is_empty() && !self.edit
+    }
+
+    /// 声明了这种格式（`Unknown` 永远不算）。
+    pub fn allows(&self, format: RichFormat) -> bool {
+        format != RichFormat::Unknown && self.formats.contains(&format)
+    }
 }
 
 /// 本人账号资料能力。
@@ -994,6 +1065,11 @@ impl Capabilities {
     /// # Errors
     /// 组合不自洽时返回一句中文说明。
     pub fn check_consistent(&self, history: HistoryMode) -> Result<(), String> {
+        if (self.conversation_groups.members || self.conversation_groups.changes)
+            && !self.conversation_groups.list
+        {
+            return Err("声明分组成员或变更通知时必须支持分组目录".into());
+        }
         if self.agent_attribution.send && !self.send.as_ref().is_some_and(|send| send.text) {
             return Err("声明 agentAttribution.send 时必须能发送文字".into());
         }
@@ -1013,6 +1089,15 @@ impl Capabilities {
                 return Err("history=none 且不能列会话时，必须声明 events.conversations".into());
             }
             _ => {}
+        }
+        if !self.rich_send.is_empty() && !self.send.as_ref().is_some_and(|send| send.text) {
+            return Err("声明 richSend 时必须能发送文字".into());
+        }
+        if self.rich_send.edit && !self.edit {
+            return Err("声明 richSend.edit 时必须能编辑（capabilities.edit）".into());
+        }
+        if self.rich_send.edit && self.rich_send.formats.is_empty() {
+            return Err("声明 richSend.edit 时要写能发的格式（richSend.formats）".into());
         }
         if self.people.bots && !self.people.get {
             return Err("声明 people.bots 时必须声明 people.get（机器人与人一起按编号读）".into());
@@ -1039,6 +1124,62 @@ impl Capabilities {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v40_rich_send_is_optional_needs_text_and_edit_and_skips_unknown_names() {
+        use super::*;
+        use serde_json::json;
+        let old: Capabilities = serde_json::from_value(json!({"send": {"text": true}})).unwrap();
+        assert!(old.rich_send.is_empty(), "旧插件不写就是不收格式正文");
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("richSend")
+                .is_none(),
+            "写回不多出键"
+        );
+
+        let mut caps: Capabilities = serde_json::from_value(json!({
+            "send": {"text": true}, "edit": true,
+            "richSend": {"formats": ["strong", "emphasis", "blockquote", "glitter"], "edit": true}
+        }))
+        .unwrap();
+        assert_eq!(caps.rich_send.formats.len(), 4);
+        assert!(caps.rich_send.allows(RichFormat::Blockquote));
+        assert!(!caps.rich_send.allows(RichFormat::Unknown));
+        assert!(
+            caps.check_consistent(HistoryMode::Server).is_err(),
+            "server 读法还缺 messages.list"
+        );
+        caps.messages.list = true;
+        assert!(caps.check_consistent(HistoryMode::Server).is_ok());
+        let back = serde_json::to_value(&caps).unwrap();
+        assert_eq!(back["richSend"]["edit"], true);
+
+        caps.edit = false;
+        assert!(
+            caps.check_consistent(HistoryMode::Server)
+                .unwrap_err()
+                .contains("richSend.edit")
+        );
+        caps.edit = true;
+        caps.send = None;
+        assert!(
+            caps.check_consistent(HistoryMode::Server)
+                .unwrap_err()
+                .contains("richSend")
+        );
+        caps.send = Some(SendCaps {
+            text: true,
+            ..SendCaps::default()
+        });
+        caps.rich_send.formats.clear();
+        assert!(
+            caps.check_consistent(HistoryMode::Server)
+                .unwrap_err()
+                .contains("formats")
+        );
+    }
+
     #[test]
     fn maintenance_declarations_are_opt_in_bounded_and_keep_old_rules_valid() {
         use serde_json::json;

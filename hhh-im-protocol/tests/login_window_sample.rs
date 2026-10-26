@@ -155,6 +155,103 @@ async fn the_sample_logs_in_through_a_login_window_and_refuses_a_wrong_link() {
     child.shutdown().await;
 }
 
+/// 向示例插件的本机页面发一个 GET，回状态行与正文。
+fn get(url: &str) -> (String, String) {
+    use std::io::{Read, Write};
+    let rest = url.strip_prefix("http://").expect("本机地址");
+    let (host, path) = rest
+        .split_once('/')
+        .map_or((rest, "/".to_owned()), |(h, p)| (h, format!("/{p}")));
+    let mut stream = std::net::TcpStream::connect(host).unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    let (head, body) = raw.split_once("\r\n\r\n").expect("响应头");
+    (
+        head.lines().next().unwrap_or_default().to_owned(),
+        body.to_owned(),
+    )
+}
+
+/// 示例插件自己的每一页（契约 v37）都是收据页的版式：右侧一栏、眉标“示例 IM”、标题、说明；不引用任何外部资源。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sample_pages_share_the_receipt_layout_and_load_nothing_external() {
+    let program = sample_program();
+    let dir = tempfile::tempdir().unwrap();
+    let child = StdioChild::spawn(program.to_str().unwrap(), &[], dir.path(), |_| {}).unwrap();
+    let conn = Connection::new(child.clone());
+    conn.call("initialize", json!({ "protocolVersions": [1], "host": { "name": "测试", "version": "0" }, "locale": "zh-CN", "tempDir": dir.path() }))
+        .await
+        .unwrap();
+    conn.call(
+        "session/open",
+        json!({ "credential": null, "settings": {}, "syncState": null }),
+    )
+    .await
+    .unwrap();
+    let start = || async {
+        conn.call("login/start", json!({ "method": "window", "values": {} }))
+            .await
+            .unwrap();
+        let step = next(&conn, "login/step").await;
+        step["step"]["url"].as_str().unwrap().to_owned()
+    };
+    let check = |page: &str, status: &str, title: &str, html: (String, String)| {
+        let (line, body) = html;
+        assert!(line.contains(status), "{page}：{line}");
+        assert!(
+            body.contains("<div class=\"screen bare\">"),
+            "{page} 用收据页的右侧一栏"
+        );
+        assert!(
+            body.contains("<div class=\"eyebrow\">示例 IM</div>"),
+            "{page}"
+        );
+        assert!(
+            body.contains(&format!("<h1>{title}</h1>")),
+            "{page}：{body}"
+        );
+        for external in [
+            "<script", "<link", " src=", "url(", "@import", "http://", "https://",
+        ] {
+            assert!(!body.contains(external), "{page} 不该有 {external}");
+        }
+        body
+    };
+    let window = start().await;
+    let origin = window.split("/window").next().unwrap().to_owned();
+    let key = state_of(&window);
+    let login = check("假登录页", "200", "登录示例 IM", get(&window));
+    assert!(login.contains("id=\"finish\"") && login.contains(">完成登录</a>"));
+    assert!(login.contains("id=\"other-app\"") && login.contains(">打开别的 App</a>"));
+    let authorize = check(
+        "假授权页",
+        "200",
+        "授权示例 IM",
+        get(&format!("{origin}/authorize?state={key}")),
+    );
+    assert!(authorize.contains(">同意</a>") && authorize.contains(">拒绝</a>"));
+    check(
+        "授权已完成",
+        "200",
+        "示例 IM 授权已完成",
+        get(&format!("{origin}/approve?state={key}")),
+    );
+    check("已结束", "404", "这次登录已经结束", get(&window));
+    let again = start().await;
+    check(
+        "已拒绝",
+        "200",
+        "没有完成授权",
+        get(&format!("{origin}/deny?state={}", state_of(&again))),
+    );
+    child.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bad_capture_is_a_step_the_host_refuses() {
     let program = sample_program();

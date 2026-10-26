@@ -77,6 +77,10 @@ pub enum Method {
     // —— 读取（宿主→插件）——
     /// 列会话。
     ConversationsList,
+    /// 列出会话分组。
+    ConversationGroupsList,
+    /// 读取分组里的完整会话。
+    ConversationGroupsMembers,
     /// 取会话。
     ConversationsGet,
     /// 搜会话。
@@ -182,6 +186,8 @@ impl Method {
             Method::SessionNotice => "session/notice",
             Method::SessionRenew => "session/renew",
             Method::AccountAvatar => "account/avatar",
+            Method::ConversationGroupsList => "conversationGroups/list",
+            Method::ConversationGroupsMembers => "conversationGroups/members",
             Method::ConversationsList => "conversations/list",
             Method::ConversationsGet => "conversations/get",
             Method::ConversationsSearch => "conversations/search",
@@ -259,6 +265,8 @@ impl Method {
             Method::SessionNotice,
             Method::SessionRenew,
             Method::AccountAvatar,
+            Method::ConversationGroupsList,
+            Method::ConversationGroupsMembers,
             Method::ConversationsList,
             Method::ConversationsGet,
             Method::ConversationsSearch,
@@ -304,6 +312,9 @@ impl Method {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
+    /// 宿主接受分组扩展及其失效事件；旧宿主缺省 false。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conversation_groups: bool,
     /// 宿主支持的协议主版本。
     pub protocol_versions: Vec<u32>,
     /// 宿主信息。
@@ -955,8 +966,8 @@ pub enum LoginStep {
         links: Vec<StepLink>,
     },
     /// 登录窗口（契约 provider-protocol v36）：宿主开一个无痕窗口显示 `url`（平台自己的登录页），页面要跳到 `capture`
-    /// 里任一开头时截下、关窗，用 `login/callback {flowId, url}` 把完整地址交给插件（每一步至多一次）。规则见
-    /// [`crate::login_window`]；打不开这种窗口的宿主（网页版）只写明要到桌面版完成。
+    /// 里任一开头时截下，用 `login/callback {flowId, url}` 把完整地址交给插件（每一步至多一次）；窗口里换成宿主的收据页，
+    /// 登录有了结局再关（v37）。规则见 [`crate::login_window`]；开不了窗时宿主的登录框写“没能打开”，用户可以再试。
     LoginWindow {
         /// 起始网址（https，或本机回环 http）。
         url: String,

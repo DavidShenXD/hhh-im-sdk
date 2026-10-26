@@ -8,6 +8,7 @@
 //!   应当拦下）。参数 `--login-window-url <网址>` 或工作目录里的 `login-window-url` 写了网址就拿它当起始网址（看真实网页在窗口里的样子），`login-window-bad-capture`
 //!   在时（或带参数 `--bad-capture`）故意声明不合格的开头（宿主与 `hhh-im-check --login window` 都应拒绝）。存凭据时带 `renewAtMs`（60 秒后），宿主到时
 //!   叫 `session/renew`。
+//!   假登录页、假授权页与之后的几页都用 HHH 收据页的版式（v37，见 [`sample_page`]），不引用任何外部资源。
 //! - 会话发现（`conversations/recentActivity`）、开放读取频率与“每分钟最多读几次”（默认 120）、按内容认编辑、正文表情写法
 //!   `{名字}` 与白底表情图、每条消息自己说能不能编辑（`editDraft`）、一对话题副本、按规则名重译、续期、账号的工作区。
 //! - 平台是 `history=server`：宿主按读取频率来读（`messages/list`），每次读都在标准错误里写一行“距上次 N 秒”，看读取间隔用。
@@ -2316,23 +2317,27 @@ fn serve(
         ("/window", Some(_)) => (
             "200 OK",
             String::new(),
-            format!(
-                "<!doctype html><meta charset=utf-8><title>示例 IM 登录</title><body style=\"font:16px system-ui;padding:40px\">\
-                 <h1>示例 IM 登录</h1><p>这是演示插件的假登录页。点“完成登录”就算登录成功。</p>\
-                 <p><a id=\"finish\" href=\"{WINDOW_CAPTURE}done?state={0}&code={CODE}\" style=\"padding:8px 16px;background:#3370ff;color:#fff;border-radius:6px;text-decoration:none\">完成登录</a></p>\
-                 <p><a id=\"other-app\" href=\"other-app://open?state={0}\">打开别的 App</a></p></body>",
-                encode(&key)
+            sample_page(
+                "登录示例 IM",
+                "演示插件的假登录页：点“完成登录”就算登录成功。",
+                &format!(
+                    "<div class=\"actions\"><a class=\"button\" id=\"finish\" href=\"{WINDOW_CAPTURE}done?state={0}&code={CODE}\">完成登录</a>\
+                     <a class=\"quiet\" id=\"other-app\" href=\"other-app://open?state={0}\">打开别的 App</a></div>",
+                    encode(&key)
+                ),
             ),
         ),
         ("/authorize", Some(_)) => (
             "200 OK",
             String::new(),
-            format!(
-                "<!doctype html><meta charset=utf-8><title>示例 IM 授权</title><body style=\"font:16px system-ui;padding:40px\">\
-                 <h1>示例 IM 授权</h1><p>HHH Friend 想读取你在示例 IM 里的消息。</p>\
-                 <p><a href=\"/approve?state={0}\" style=\"padding:8px 16px;background:#3370ff;color:#fff;border-radius:6px;text-decoration:none\">同意</a>\
-                 &nbsp;<a href=\"/deny?state={0}\">拒绝</a></p></body>",
-                encode(&key)
+            sample_page(
+                "授权示例 IM",
+                "演示插件的假授权页：点“同意”就算授权成功。",
+                &format!(
+                    "<div class=\"actions\"><a class=\"button\" href=\"/approve?state={0}\">同意</a>\
+                     <a class=\"quiet\" href=\"/deny?state={0}\">拒绝</a></div>",
+                    encode(&key)
+                ),
             ),
         ),
         ("/approve", Some((_, Some(callback)))) => {
@@ -2352,7 +2357,11 @@ fn serve(
             (
                 "200 OK",
                 String::new(),
-                "<!doctype html><meta charset=utf-8><body style=\"font:16px system-ui;padding:40px\">示例 IM 授权已完成，可以关掉这个页面。</body>".to_owned(),
+                sample_page(
+                    "示例 IM 授权已完成",
+                    "请返回 HHH 等待连接完成，这个页面可以关掉了。",
+                    "",
+                ),
             )
         }
         ("/deny", Some((flow_id, _))) => {
@@ -2365,13 +2374,17 @@ fn serve(
             (
                 "200 OK",
                 String::new(),
-                "<!doctype html><meta charset=utf-8><body style=\"font:16px system-ui;padding:40px\">已拒绝。</body>".to_owned(),
+                sample_page(
+                    "没有完成授权",
+                    "请返回 HHH 查看原因后重试，这个页面可以关掉了。",
+                    "",
+                ),
             )
         }
         _ => (
             "404 Not Found",
             String::new(),
-            "<!doctype html><meta charset=utf-8>这次登录已经结束或不存在。".to_owned(),
+            sample_page("这次登录已经结束", "请回到 HHH 重新登录。", ""),
         ),
     };
     let _ = write!(
@@ -2380,6 +2393,48 @@ fn serve(
         body.len()
     );
     let _ = stream.flush();
+}
+
+/// 示例插件自己页面的样式（v37）：照抄中继收据页（hhh-im-callback-server `relay.mjs` 的 `RECEIPT_STYLE`）右侧一栏的版式，
+/// 按钮照抄 Friend 登录页的 `.login-button` / `.login-primary` / `.login-quiet`。示例插件是独立程序，不带 HHH 的红花图；
+/// 页面里没有脚本与外部资源。
+const SAMPLE_PAGE_STYLE: &str = concat!(
+    ":root{color-scheme:dark;--bg:#0d1117;--text:#d7dde4;--dim:#8b949e;--line-strong:#3a444f;--panel:#14181d;--red:#e5484d;",
+    "--font-sans:'Inter Variable',Inter,-apple-system,BlinkMacSystemFont,'PingFang SC','Hiragino Sans GB','HarmonyOS Sans SC',",
+    "'Microsoft YaHei UI','Microsoft YaHei','Noto Sans CJK SC','Source Han Sans SC','Segoe UI',system-ui,sans-serif}",
+    "@media (prefers-color-scheme:light){:root{color-scheme:light;--bg:#f6f8fa;--text:#1f2328;--dim:#57606a;--line-strong:#afb8c1;--panel:#eaeef2;--red:#cf222e}}",
+    "*{box-sizing:border-box;margin:0}html,body{height:100%}",
+    "body{background:var(--bg);color:var(--text);font:400 14px/1.6 var(--font-sans);word-break:keep-all;overflow-wrap:anywhere}",
+    ".screen{display:grid;grid-template-columns:minmax(0,1fr);height:100dvh;overflow:hidden}",
+    ".stage{display:flex;min-width:0;min-height:0;overflow:auto}",
+    "main{width:min(440px,calc(100% - 120px));margin:auto;padding:64px 0;animation:enter 360ms cubic-bezier(.4,0,.2,1) both}",
+    ".eyebrow{display:flex;align-items:center;gap:9px;margin-bottom:20px;font-size:12px;font-weight:600;letter-spacing:.14em;color:var(--dim)}",
+    ".eyebrow::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--red)}",
+    "h1{margin-bottom:10px;font-size:26px;font-weight:600;line-height:1.4;letter-spacing:-.025em}",
+    ".lead{color:var(--dim);line-height:1.8}",
+    ".actions{display:flex;flex-direction:column;align-items:stretch;gap:4px;margin-top:28px}",
+    ".button{display:inline-flex;min-height:46px;align-items:center;justify-content:center;border-radius:999px;padding:0 17px;",
+    "font:600 14px/1 var(--font-sans);border:1px solid var(--line-strong);background:transparent;color:var(--text);text-decoration:none;",
+    "transition:background-color .16s,border-color .16s}",
+    ".button:hover{background:color-mix(in srgb,var(--panel) 98%,var(--text));border-color:var(--dim)}",
+    ".button:active{background:var(--panel);border-color:var(--text)}",
+    ".quiet{display:inline-flex;min-height:44px;align-items:center;justify-content:center;color:var(--dim);font:400 13px/1 var(--font-sans);",
+    "text-decoration:none;transition:color .16s}",
+    ".quiet:hover{color:var(--text)}",
+    ".button:focus-visible,.quiet:focus-visible{outline:2px solid var(--dim);outline-offset:3px}",
+    "@keyframes enter{from{opacity:0}}",
+    "@media(max-width:700px){main{width:calc(100% - 48px);max-width:440px;padding:32px 0}}",
+    "@media(prefers-reduced-motion:reduce){main{animation:none}.button,.quiet{transition:none}}",
+);
+
+/// 示例插件自己的一页：眉标“示例 IM”、标题、说明，下面可以放按钮（`actions` 是现成的 HTML）。
+fn sample_page(title: &str, lead: &str, actions: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <meta name=\"color-scheme\" content=\"dark light\"><title>{title}</title><style>{SAMPLE_PAGE_STYLE}</style></head>\
+         <body><div class=\"screen bare\"><div class=\"stage\"><main><div class=\"eyebrow\">示例 IM</div><h1>{title}</h1>\
+         <p class=\"lead\">{lead}</p>{actions}</main></div></div></body></html>"
+    )
 }
 
 /// 地址查询串里的各项（百分号解码）。

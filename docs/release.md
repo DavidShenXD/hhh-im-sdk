@@ -24,6 +24,8 @@ HHH 只从插件清单 `source` 写的仓库检查、下载新版本，只读一
 - `wasm32-wasip2` 包里放编成 WASM 组件的程序（`cargo build --release --target wasm32-wasip2`），iPhone / iPad 上的 HHH
   在 App 里运行它：照常经标准输入输出说协议（插件运行时 `serve_stdio_on` 已在 WASI 上接好），能连网络（TCP、域名解析），
   只看得到自己的临时目录，不能起子进程、不能开监听端口、没有组播。
+  联网用 SDK 的 `hhh-im-net`（reqwest 在 wasm32 上只有浏览器版本，WASI 里用不了）；HHH 的统一 CI 在 iPhone 包的依赖里
+  发现 reqwest 就不通过。
 - HHH 解包时拒绝绝对路径、`..`、链接，以及超过 1 万个文件或解压后 1 GB 的包。
 
 ## 3. 发一个版本

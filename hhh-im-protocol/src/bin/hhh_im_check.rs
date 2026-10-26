@@ -16,6 +16,9 @@ use hhh_im_protocol::platform::{Capabilities, HistoryMode, Manifest, PlatformDes
 use hhh_im_protocol::transport::{Connection, Incoming, StdioChild};
 use serde_json::{Value, json};
 
+#[path = "hhh_im_check/rich_send.rs"]
+mod rich_send;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Status {
     Pass,
@@ -426,6 +429,13 @@ async fn run(args: Args) -> i32 {
         }
         (None, _) => report.skip("发送检查", "未给 --allow-send，跳过真实发送"),
     }
+    rich_send::check(
+        &conn,
+        &mut report,
+        args.allow_send.as_deref(),
+        Some(&caps.rich_send),
+    )
+    .await;
 
     // 9b. 宿主头像（provider-protocol v35）：交头像会改本人在这家 IM 的头像、发给别人，算写操作，同发送一样要 --allow-send。
     match (caps.account.host_avatar, &args.allow_send) {

@@ -1,0 +1,68 @@
+# ============================================================
+# hhh-im-net —— IM 插件联网的唯一入口（电脑与 iPhone / iPad 同一套写法）
+#
+# 插件向平台发 HTTP 请求、直接开 TCP 连接都经本包：
+#   电脑（Windows / macOS / Linux）：就是 reqwest 本身（原样重新导出），另加统一的 TLS 握手设置
+#     （aws-lc-rs，优先抗量子 X25519MLKEM768 并带 X25519，只缓存会话票据）、下载用客户端入口、
+#     不带地址的网络错误原因。
+#   iPhone / iPad（wasm32-wasip2）：reqwest 在 wasm32 上只有浏览器版本，WASI 里用不了；这里是接口同名的
+#     一套实现（hyper HTTP/1.1 跑在 tokio 上，同一份 TLS 设置），插件代码不用分平台写。
+#
+# 与 hhh-im-protocol 一起导出到公开仓库 hhh-im-sdk、同一个标签；版本号只由「SDK 发布」改。
+# 不依赖其它 HHH crate；HHH 宿主不依赖它。
+# ============================================================
+
+[package]
+name = "hhh-im-net"
+version = "0.12.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/MagicLizi/hhh-im-sdk"
+description = "HHH IM 插件联网模块：电脑上是 reqwest 加防掐断握手，iPhone / iPad（wasm32-wasip2）上是接口同名的实现"
+
+[features]
+default = []
+# test-client：信任测试根证书的客户端 TLS 设置（iPhone 版的测试程序也能开）。
+# test-server：再加本机测试服务器（HTTP、带测试根证书的 HTTPS、几种坏服务器、握手探针），只在电脑上。
+# 给本包与 hhh-wasm 的测试用，插件不用开。
+test-client = []
+test-server = ["test-client", "hyper/server"]
+
+[dependencies]
+# rustls：TLS（aws-lc-rs 加密后端，优先抗量子密钥交换）；两边共用一份设置（src/tls.rs）。
+rustls = { version = "0.23.27", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12", "logging"] }
+webpki-roots = { version = "1" }
+# tokio：TCP 连接、超时；插件本来就跑在 tokio 上（SDK 运行时）。
+tokio = { version = "1", default-features = false, features = ["net", "time", "rt", "io-util", "sync"] }
+bytes = { version = "1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+tracing = { version = "0.1" }
+# 以下是 iPhone 那套实现用的（电脑上也编进来：同一份实现在电脑上对照测试；reqwest 本来就依赖它们）。
+# hyper：HTTP/1.1 客户端连接（不带连接池，池子在 src/lite/pool.rs）；服务器那一半只在 test-server 下开。
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+# tokio-rustls：在 TCP 上握 TLS；不开它的默认特性，加密后端只用上面 rustls 的 aws-lc-rs。
+tokio-rustls = { version = "0.26", default-features = false }
+url = "2"
+serde_urlencoded = "0.7"
+percent-encoding = "2"
+mime = "0.3"
+# flate2：gzip 响应边收边解（纯 Rust 后端）。
+flate2 = { version = "1" }
+# getrandom：multipart 分界串。
+getrandom = { version = "0.3" }
+# base64：`basic_auth` 的请求头。
+base64 = { version = "0.22" }
+
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+# 电脑上就是 reqwest 本身（features 与 HHH 一致，另开 multipart）。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "gzip", "stream", "multipart"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+# 本包测试里起本机测试服务器。
+hyper = { version = "1", features = ["server"] }
+

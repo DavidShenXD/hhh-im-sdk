@@ -246,6 +246,7 @@
 - `retranslate` 为真时，程序随消息附带去凭据化的原始数据（§7.4 的 `raw`），宿主存一张原始数据表；程序翻译规则升级后，宿主调 `messages/retranslate`（§10.1）让它把本地旧消息重新翻译一遍。为假时不附带原始数据、也不会被调用重译。
 - `messageMaintenance`（可选，默认假）允许宿主把已存的统一消息交给程序做本地修正或重读判定，不依赖 `raw`，不替代 `retranslate`。旧程序省略此能力照常接入。
 - `agentAttribution: {send, receive}`（可选）分别声明跨账号发送和接收伙伴署名，规则见 §7.4a；两项默认 false。send 要求可发文字，receive 要求可读取或接收消息。
+- `richSend: {formats, edit?}`（可选）声明 §7.8 的格式发送；`formats` 取 `strong`、`emphasis`、`underline`、`delete`、`inlineCode`、`link`、`blockquote`、`list`、`code`。要求 `send.text`，`edit: true` 另要求 `edit`。未知格式名忽略；省略或格式集合为空时不收格式正文。协议主版本不变。
 
 - **只读连接**：`send` 为 null，或者其中各项都是 false。宿主不显示输入框，伙伴不在这个连接上回复，所有发送请求都在本地直接拒绝。
 - `history=server` 时，`messages.list` 必须为真。`history=none` 时，`events.messages` 必须为真。
@@ -262,7 +263,7 @@
 |---|---|---|
 | `qrCode` | `image`（PNG 的 base64，不超过 512 KiB）、`expiresAtMs`、`hint` | 二维码和倒计时。码过期后由程序自己换新码，再发一次这个步骤 |
 | `openUrl` | `url`（https，或本机回环地址的 http）、`label` | 一个“打开浏览器”按钮，不在页面里嵌入网页 |
-| `loginWindow`（v36） | `url`（同 `openUrl`）、`label`、`capture`（要截下的跳转开头，1–4 项） | 桌面版开一个无痕登录窗口显示 `url`，截到跳转后关窗、经 `login/callback` 交给程序；登录框里一颗把窗口叫到前面 / 重新打开的按钮（文字用 `label`）；网页版写明这一步要在桌面版完成。见本节末尾“登录窗口” |
+| `loginWindow`（v36） | `url`（同 `openUrl`）、`label`、`capture`（要截下的跳转开头，1–4 项） | 桌面版开一个无痕登录窗口显示 `url`，截到跳转后经 `login/callback` 交给程序、窗口里换成宿主的收据页，登录有了结局再关窗；登录框里一颗把窗口叫到前面 / 重新打开的按钮（文字用 `label`）。见本节末尾“登录窗口” |
 | `confirmOnDevice` | `message` | 等待提示，例如“请在手机上确认” |
 | `input` | `fields: [{id, label, secret, placeholder, pattern}]` | 一个表单。用户提交后，宿主调用 `login/submit {flowId, values}` |
 | `message` | `text`、`tone`（`info` / `warn`） | 一段说明文字 |
@@ -279,13 +280,13 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 - 同一时间只有一个登录流程。新的 `login/start` 会取消还没结束的旧流程。
 - 需要浏览器授权回调（OAuth）的，有两种做法：程序自己在本机回环地址上监听，并把这个地址写进 `openUrl` 步骤里；或者（v12）在登录方式里声明 `callbackPath`，由宿主在本机地址上收（§6.1a）。
 - 程序必须在收到 `credential/save` 的成功回复之后，才能发 `login/finished`。
-- `openUrl` 一步到了，宿主自动打开它（桌面版交给系统默认浏览器，网页版新标签），登录框里的次按钮（文字用 `label`）能再打开一次（v12）；打开的登录页宿主不关，登录结束后由用户关（friend/im-auth-relay v8 起，此前桌面版在授权窗口里、结束后关窗）。
+- `openUrl` 一步到了，宿主自动打开它（桌面版交给系统默认浏览器），登录框里的次按钮（文字用 `label`）能再打开一次（v12）；打开的登录页宿主不关，登录结束后由用户关（friend/im-auth-relay v8 起，此前桌面版在授权窗口里、结束后关窗）。
 - **登录窗口**（v36）：登录走完时平台跳到一个系统浏览器截不住的链接（如 `slack://…/magic-login-sso/<码>`，系统会把它交给对应的 App）时用这一步。
   - `capture` 每项二选一：自定义协议的 `<协议>://…`（协议不能是 http、https、file、javascript、data、about、blob、ws、wss、ftp、view-source），或 https 开头且带地址与至少一段路径（如 `https://app.example.com/t/`，只到地址的不行）；每项至多 200 字。比较时协议名与地址（`://` 之后、第一个 `/` 之前）不分大小写，其余按字面前缀。`url` 不合规、`capture` 为空 / 超过 4 项 / 有不合格的项，这一步宿主不显示，这次流程按失败处理（同 v13 超出上限的步骤）。规则在协议包 `login_window` 模块（`start_url_ok`、`capture_ok`、`captured`），宿主、自检工具与程序共用。
-  - 桌面版宿主一到这一步就开窗（同一步只自动开一次），一次至多一个窗口；窗口无痕、与宿主自己的浏览数据隔离、关掉即清空；窗口里只放行 http/https，网页要开新窗口的在同一个窗口里打开，别的协议一律拦下；窗口没有任何宿主权限。页面要跳到对得上 `capture` 的地址时，宿主取消这次跳转、关窗，发 `login/callback {flowId, url}`（`url` 是完整地址，与 §6.1a 本机回调同一个方法），每一步至多一次。程序核对后照常以 `login/finished` 或 `login/failed` 结束；对不上这次登录的链接应以 `login/failed` 说明原因。
-  - 用户自己关了窗口不算取消：登录框写“登录窗口已关闭”，按钮重新打开（从 `url` 重来）。登录有了结局、程序推了别的步骤或新的 `loginWindow`、程序退出时，宿主关窗。
+  - 桌面版宿主一到这一步就开窗（同一步只自动开一次），一次至多一个窗口；窗口无痕、与宿主自己的浏览数据隔离、关掉即清空；窗口里只放行 http/https，网页要开新窗口的在同一个窗口里打开，别的协议一律拦下；窗口没有任何宿主权限。页面要跳到对得上 `capture` 的地址时，宿主取消这次跳转，窗口里换成宿主自己的收据页（“<名字> 授权结果已收到，正在完成登录”，v37），发 `login/callback {flowId, url}`（`url` 是完整地址，与 §6.1a 本机回调同一个方法），每一步至多一次。程序核对后照常以 `login/finished` 或 `login/failed` 结束；对不上这次登录的链接应以 `login/failed` 说明原因。
+  - 用户自己关了窗口不算取消：登录框写“登录窗口已关闭”，按钮重新打开（从 `url` 重来）；截到以后关掉收据页不影响登录。登录有了结局、程序推了别的步骤或新的 `loginWindow`、程序退出时，宿主关窗（截到以后至少让收据页停 1 秒）。
   - 截取规则只在宿主，推给页面的那一步不带；`url` 与截下的地址不进日志。宿主不注册任何协议处理器、不改系统的默认打开方式。
-  - 宿主不告诉程序自己能不能开窗：网页版的登录框写明要到桌面版完成，只留取消。旧宿主读不懂这一步，这次登录会失败；用它的程序依赖含这一步的 SDK（`minHost` 由打包工具自动写），旧宿主装不上。
+  - 宿主不告诉程序自己能不能开窗：开不了时登录框写“登录窗口没能打开”，按钮再试一次。旧宿主读不懂这一步，这次登录会失败；用它的程序依赖含这一步的 SDK（`minHost` 由打包工具自动写），旧宿主装不上。
 
 ### 6.1a 登录方式（v12，可选）
 
@@ -313,7 +314,7 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 - **预填中继**（v14）：`relay` 可以写 `defaultValue`（https 网址）：没保存过中继地址时框里预填它；不写就空着让用户填。
 - **App Secret 的说明**（v14）：`ownApp` 可以写 `secretHelp`：去哪找、存在哪，画在 Secret 框旁的 ⓘ 里。
 - **用宿主账号登录**（v13）：令牌只在这次 `login/start` 里给一次，宿主当场取（快到期先刷新）、不存、不进日志与 wire 记录；程序要再用就自己放进凭据。宿主不允许的程序声明了这一类，宿主不登记它。声明了 `host`、这个宿主账号下还没登录、也没被用户在宿主里手动退出过的程序，宿主在三个时候自动开始这种登录，不用用户点：刚装好、宿主启动、切到这个宿主账号；自动开始的登录不弹登录框，程序推来 `message` 以外的步骤才弹出来，只推 `message` 就以 `login/finished` 结束时卡片直接变成已连接，失败时不弹窗、卡片写程序给的原因。用户手动退出后不再自动开始，点“登录”时登录框写着当前宿主账号，点了才开始。
-- **本机回调**：`ownApp` 声明了 `callbackPath` 时，写相对路径（v14，如 `callback`）宿主就拼在这个 IM 自己的 `/hhh-friend-im/<平台编号>/` 下面，程序不必知道宿主怎么给它编号；照 v12 写以 `/` 开头的完整路径时，必须已经在这个目录下面（不合要求时宿主不登记这种方式）。宿主在 `http://localhost:<Friend 端口><callbackPath>` 收：只在这个程序正在登录、路径对、`state` 对得上时，用 `login/callback {flowId, url}`（宿主→程序请求，`url` 是带查询串的完整地址）交给程序，页面写“<名字>授权已完成，可以关掉这个页面。登录结果在 Friend 里显示。”；其余一律拒绝。程序核对后照常以 `login/finished` 或 `login/failed` 结束。
+- **本机回调**：`ownApp` 声明了 `callbackPath` 时，写相对路径（v14，如 `callback`）宿主就拼在这个 IM 自己的 `/hhh-friend-im/<平台编号>/` 下面，程序不必知道宿主怎么给它编号；照 v12 写以 `/` 开头的完整路径时，必须已经在这个目录下面（不合要求时宿主不登记这种方式）。宿主在 `http://localhost:<Friend 端口><callbackPath>` 收：只在这个程序正在登录、路径对、`state` 对得上时，用 `login/callback {flowId, url}`（宿主→程序请求，`url` 是带查询串的完整地址）交给程序，页面是宿主的收据页“<名字> 授权结果已收到”（v37 起，同中继的收据页；此前是一行纯文字）；其余一律拒绝，页面写“这次登录已经结束”。程序核对后照常以 `login/finished` 或 `login/failed` 结束。
 
 ### 6.2 凭据由宿主保存
 
@@ -497,6 +498,10 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 ### 7.8 发出的内容（Outgoing）
 
 `text{text}`、`mention{userId,name}`、`mentionAll`、`image{key}`、`file{key}`。其中的 `key` 来自 `uploads/finish`。
+
+声明 `richSend` 后还可收到 `rich{root}`，根为 `{type:"root",children:[…]}`，节点复用 §7.6。一条格式正文单独占一条消息，不与附件或其它内容块混发。段落、文字、换行、提及和表情为基础节点，其余按 `formats`；提及仍受 `send.mentions` / `send.mentionAll` 约束。
+
+宿主在交给插件之前剥去未声明格式、保留文字，并核对一条正文最多 2048 节点、24 层及发送字节预算。插件仍须核对平台限制。`richSend.edit` 为真时 `messages/edit` 与 `Message.editDraft` 可使用同一形状；不允许编辑的消息不提供 `editDraft`。没用格式时仍使用原有文字与提及块。
 
 ## 8. 读取方法（宿主→程序）
 
@@ -885,6 +890,20 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 - `settings` 是内置平台在 HHH 连接设置里的那一栏原样（各平台字段不同，如登录方式 `mode`、`appId`、`relayUrl`），其中存在系统凭据库里的密钥换成明文（如 `appSecret`），授权的引用去掉。密钥只经标准输入交这一次，宿主不写日志。
 - 程序先经 `credential/save` 保存自己的凭据，收到成功回复后再回 `online`，并用 `adoptedSettings`（§4.2）交回参数和登录设置。宿主确认凭据、参数与登录设置全部落盘后才删除旧引用；未完成则保留旧材料。插件已有凭据但设置交接中断时，可在普通 `session/open` 再返回 `adoptedSettings` 补齐；借用凭据时不转存、不删除来源。关注、本机消息与文件沿用同编号的数据。
 
+## 可选会话分组扩展
+
+此扩展是只读会话导航，不是创建群聊、标星或自动回复规则。协议主版本仍为 1。
+
+- 宿主在 `initialize` 增加 `conversationGroups:true`，表示接受下面的事件；缺省 false。插件仅对声明接受的宿主发送新事件，旧宿主照常接收原事件批次。
+- `capabilities.conversationGroups:{list,members,changes}` 各项缺省 false；members、changes 需要 list。未声明的插件不被调用、不显示入口。
+- `conversationGroups/list {limit,cursor?}` 返回 `{items:[{id,name,kind,sortKey?}],nextCursor?,incomplete?}`。kind 为 label 或 smart；id 是账号内不透明编号，不能以名字当身份。sortKey 按 Unicode 码点升序，缺省排最后，同键按 id 排序。编号最多 256 UTF-8 字节、名字最多 1024、排序键最多 256。
+- `conversationGroups/members {groupId,limit,cursor?}` 返回相同分页信封，items 为完整的 `Conversation`，包括宿主未见过的会话；不能只返回宿主已加载的交集。读取不创建会话、不改归属、不标已读。
+- limit 为 1–100。首屏省略 cursor（null 同无游标），后续原样传回。单页最多 100 项，游标最多 8192 UTF-8 字节。只有缺省/null 的 nextCursor 表示结束，空项目页仍可有下一页；空串、重复游标、预算耗尽都应报错。incomplete 标记暂时无法表示的项目，不能默默当成空组。
+- `events/push` 新事件 `{type:"conversationGroupsChanged",catalog:boolean,groupIds:string[]}` 只表示失效，groupIds 为空表示所有组。走原确认、重试和取消边界，不新增推送通道。
+- 宿主将目录与当前组成员分别做有界完整读取：100 页/1000 组、500 页/10000 会话；全部成功才替换内存，失败保留旧内容可重试。读取中收到失效后再补读一次；进入、事件流重连或 resync 同样补读。账号或来源切换取消旧读，不接受迟到结果。不新增持久化文件或游标账本。
+- 旧 SDK 插件可按同一正式 JSON 形状实现增量；SDK 导出/发布仍独立进行，不假称旧标签已包含新 Rust 类型。执行类型见 `hhh-im-protocol/src/groups.rs`，兼容与真实 provider/hub 测试见 `provider_groups.rs`。
+
+
 ## 变更记录
 
 - 2026-10-22：新增可选 `AgentAttribution`、发送参数和消息字段、独立收发能力声明、容错与体积预算；`hhh-im-check --allow-send` 对声明发送署名的插件检查回包保留。协议主版本保持 1；实际插件适配与 SDK 发布独立进行。
@@ -899,4 +918,5 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 - 2026-10-22（契约 v31，全部为可选的加法，主版本仍是 1）：表情写进文字的写法 `emoji.textTemplate`（宿主据此给输入框的表情按钮）、`textPattern` 认出的是名字还是编号跟写法一致；表情的 `inText`；目录分类的 `icon`；§17 新检查。
 - 2026-10-22（契约 v35，可选的加法，主版本仍是 1）：能力 `account.hostAvatar` 与宿主→程序请求 `account/avatar {avatar}`（本机用户头像：PNG / JPEG、边长 256 与 256 KiB 以内，§6.8）；`hostAccount.avatarUrl` 宿主不再填；§14 新预算；§17 新检查（需要 `--allow-send`）。
 - 2026-10-22（契约 v32，可选的加法，主版本仍是 1）：能力 `perf`、`perf/start` / `perf/stop` 请求与 `perf/report` 通知（§11.6）、自报上限（§14）、自检第 15 项；SDK `runtime` 自动声明并上报。
+- 2026-10-25（契约 v37，程序不用改）：登录窗口截到跳转后窗口里换成宿主的收据页，登录有了结局再关；本机回调的页面换成同一张收据页；示例插件页面换成收据页版式。
 - 2026-10-25（契约 v36，可选的加法，主版本仍是 1）：登录步骤 `loginWindow`（§6.1“登录窗口”：桌面版无痕登录窗口，截到 `capture` 开头的跳转经 `login/callback` 交给程序）；协议包 `login_window` 模块；§14 新预算；`hhh-im-check --login` 与自检第 16 项。
