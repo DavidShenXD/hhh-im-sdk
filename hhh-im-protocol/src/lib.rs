@@ -24,6 +24,8 @@ pub mod login_window;
 pub mod method;
 pub mod platform;
 pub mod release;
+pub mod resources;
+pub use resources::{ResourceVariant, ResourceVariants};
 pub mod rpc;
 mod stickers;
 pub use stickers::*;

@@ -117,6 +117,8 @@ pub enum Method {
     // —— 资源（宿主→插件）——
     /// 读消息资源一段。
     ResourcesRead,
+    /// 描述消息资源实际可用的预览与原件。
+    ResourcesDescribe,
     /// 读头像一段。
     AvatarsRead,
     /// 读表情图一段。
@@ -218,6 +220,7 @@ impl Method {
             Method::StickersImage => "stickers/image",
 
             Method::ResourcesRead => "resources/read",
+            Method::ResourcesDescribe => "resources/describe",
             Method::AvatarsRead => "avatars/read",
             Method::EmojiImage => "emoji/image",
             Method::UploadsBegin => "uploads/begin",
@@ -302,6 +305,7 @@ impl Method {
             Method::StickersFavorite,
             Method::StickersImage,
             Method::ResourcesRead,
+            Method::ResourcesDescribe,
             Method::AvatarsRead,
             Method::EmojiImage,
             Method::UploadsBegin,
@@ -1841,6 +1845,33 @@ pub struct ResourcesReadParams {
     pub offset: u64,
     /// 最多读多少（≤1 MiB）。
     pub length: u64,
+    /// `resources/describe` 给出的实际版本编号；旧宿主省略时保留插件原来的取法。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+}
+
+impl ResourcesReadParams {
+    /// 分段流的身份包含版本，不能在预览与原件之间复用读流。
+    pub fn segment_key(&self) -> String {
+        serde_json::to_string(&(
+            &self.conversation_id,
+            &self.message_id,
+            &self.key,
+            self.kind,
+            &self.variant,
+        ))
+        .expect("资源编号与类型总能序列化")
+    }
+}
+
+/// `resources/describe` 的参数；不读取文件字节。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourcesDescribeParams {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub key: String,
+    pub kind: ResourceKind,
 }
 
 /// `avatars/read` 参数。

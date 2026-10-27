@@ -414,6 +414,9 @@ async fn run(args: Args) -> i32 {
         let found = find_resource(&collected.lock().unwrap().events);
         if let Some((conv, msg, key, kind)) = found {
             check_resource_read(&conn, &mut report, &conv, &msg, &key, &kind).await;
+            if caps.resources.variants {
+                check_resource_variants(&conn, &mut report, &conv, &msg, &key, &kind).await;
+            }
         } else {
             report.skip("资源分段读", "推送里没有可读资源样本");
         }
@@ -1265,6 +1268,78 @@ fn find_resource(events: &[Value]) -> Option<(String, String, String, String)> {
         }
     }
     None
+}
+
+/// 版本声明必须有效；每份实际字节都单独读一段，不把原件的大文件整份载入自检。
+async fn check_resource_variants(
+    conn: &Arc<Connection>,
+    report: &mut Report,
+    conv: &str,
+    msg: &str,
+    key: &str,
+    kind: &str,
+) {
+    use base64::Engine as _;
+    let params = json!({"conversationId":conv,"messageId":msg,"key":key,"kind":kind});
+    let value = match conn.call("resources/describe", params.clone()).await {
+        Ok(value) => value,
+        Err(error) => {
+            report.fail("资源版本说明", error.message);
+            return;
+        }
+    };
+    let description = match serde_json::from_value::<hhh_im_protocol::ResourceVariants>(value) {
+        Ok(description) => description,
+        Err(_) => {
+            report.fail("资源版本说明", "结果不是规范的资源版本列表");
+            return;
+        }
+    };
+    if let Err(reason) = description.validate() {
+        report.fail("资源版本说明", reason);
+        return;
+    }
+    report.pass("资源版本说明合法且不重复原件");
+    for variant in &description.variants {
+        let mut read = params.clone();
+        read["variant"] = variant.id.clone().into();
+        read["offset"] = 0.into();
+        read["length"] = (64 * 1024).into();
+        let label = format!("资源版本 {} 可单独分段读取", variant.id);
+        let value = match conn.call("resources/read", read).await {
+            Ok(value) => value,
+            Err(error) => {
+                report.fail(&label, error.message);
+                continue;
+            }
+        };
+        let chunk = match serde_json::from_value::<hhh_im_protocol::method::ResourceChunk>(value) {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                report.fail(&label, "分段结果格式不正确");
+                continue;
+            }
+        };
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(&chunk.data) {
+            Ok(bytes) if !bytes.is_empty() && bytes.len() <= 64 * 1024 => bytes.len() as u64,
+            _ => {
+                report.fail(&label, "分段数据为空、超限或不能解码");
+                continue;
+            }
+        };
+        if chunk
+            .total
+            .is_some_and(|total| bytes > total || (chunk.eof && bytes != total))
+            || variant
+                .bytes
+                .zip(chunk.total)
+                .is_some_and(|(expected, actual)| expected != actual)
+        {
+            report.fail(&label, "版本大小或分段 eof 与实际数据不一致");
+        } else {
+            report.pass(&label);
+        }
+    }
 }
 
 async fn check_resource_read(

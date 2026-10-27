@@ -935,6 +935,9 @@ pub struct ResourceCaps {
     /// 能读头像。
     #[serde(default)]
     pub avatars: bool,
+    /// 能描述并按稳定编号读取同一资源的预览与原件；旧插件不写。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub variants: bool,
 }
 
 /// 推送事件能力。
@@ -1068,6 +1071,9 @@ impl Capabilities {
     /// # Errors
     /// 组合不自洽时返回一句中文说明。
     pub fn check_consistent(&self, history: HistoryMode) -> Result<(), String> {
+        if self.resources.variants && !self.resources.read {
+            return Err("声明 resources.variants 时必须能读取资源（resources.read）".into());
+        }
         if (self.conversation_groups.members || self.conversation_groups.changes)
             && !self.conversation_groups.list
         {

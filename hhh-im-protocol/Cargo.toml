@@ -15,7 +15,7 @@
 [package]
 name = "hhh-im-protocol"
 # 协议包自己定版、不跟 HHH 走：公开仓库 hhh-im-sdk 按这个版本打标签（scripts/im-sdk-export.py 读它）。
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/MagicLizi/hhh-im-sdk"
@@ -25,7 +25,7 @@ description = "HHH-IM-Protocol：HHH 的 IM 插件协议（线上类型、编解
 default = []
 # transport：子进程 stdio 传输（tokio）。宿主侧（hhh-im provider 适配器、自检工具）开它；
 # 只用线上类型与编解码的一方可以不开。
-transport = ["dep:tokio", "dep:regex-lite"]
+transport = ["dep:tokio", "dep:regex-lite", "dep:base64"]
 # runtime：写插件程序用的运行时（契约 provider-protocol v15 §3.4）：协议服务（并发处理、取消、向宿主发请求等回复）、
 # 日志转 log/write、资源分段读、上传攒齐与核对、平台请求计数。只给插件开，HHH 宿主不用。
 # 编 WASM 包（wasm32-wasip2，iPhone / iPad 用，契约 provider-protocol v18）时，运行时的标准输入输出改走 WASI 的接口（wasip2）。
@@ -41,7 +41,7 @@ tracing = { version = "0.1" }
 tokio = { version = "1", default-features = false, optional = true, features = ["rt", "io-util", "time", "sync", "macros"] }
 # 自检工具核对插件声明的正文表情写法能不能编译（契约 provider-protocol v12 缺口 9），只在 transport feature 下用。
 regex-lite = { version = "0.1", optional = true }
-# 插件运行时：tracing 日志接成 log/write（只用注册表部件）、资源与上传按 base64 传，只在 runtime feature 下用。
+# 插件运行时：tracing 日志接成 log/write（只用注册表部件）。base64 用于运行时资源、上传及 transport 自检的分段核对。
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"], optional = true }
 base64 = { version = "0.22", optional = true }
 # 安装包：zip 读写与 sha256（runtime 也用 sha256 核对上传），只在 package、runtime feature 下用。

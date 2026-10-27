@@ -537,7 +537,8 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 
 | 方法 | 参数 | 结果 |
 |---|---|---|
-| `resources/read` | `conversationId`、`messageId`、`key`、`kind`、`offset`、`length`（不超过 1 MiB） | `{data: base64, total?, sha256?, eof}` |
+| `resources/describe` | `conversationId`、`messageId`、`key`、`kind`；需 `resources.variants` | `{variants: ResourceVariant[]}` |
+| `resources/read` | `conversationId`、`messageId`、`key`、`kind`、`variant?`、`offset`、`length`（不超过 1 MiB） | `{data: base64, total?, sha256?, eof}` |
 | `avatars/read` | `key`、`offset`、`length` | 同上 |
 | `emoji/image` | `emojiType`、`offset`、`length` | 同上 |
 
@@ -546,6 +547,27 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 - 程序声明了 `fileSegmentBytes` 时，宿主按段读，断了可以续传。没有声明时，宿主从 0 开始连续读到 `eof`，中途断了就从头再读。
 - 这条消息已经没有这个资源时，回 `notFound`，宿主会换别的消息去取，或者标成“读不到”。暂时读不到时，回 `disconnected`。
 - `emoji/image`：声明了 `emoji.unlisted.guess`（v12）时，宿主也会拿目录外的表情类型来问；程序按自己的规律猜，猜不到回 `notFound`，界面写名字。
+
+### 9.1.1 图片预览与原件
+
+插件可声明 `capabilities.resources.variants: true`，必须同时声明 `resources.read`。宿主先调 `resources/describe`，再将选中版本的 `id` 放进 `resources/read.variant`。未声明的旧插件不会被调用新方法，省略 `variant` 继续原有读取行为；旧资源不能被宿主冒称为已验证的原件。
+
+一个 `ResourceVariant` 描述一份实际字节：
+
+| 字段 | 含义 |
+|---|---|
+| `id` | 资源内稳定、不透明、唯一的版本编号；不含地址、凭据或控制字符，字节预算同普通编号 |
+| `preview?` | 可用于显示；缺省 false |
+| `original?` | 平台提供的真实原始文件；缺省 false，不允许用缩略图替代 |
+| `mime?`、`name?`、`bytes?` | 当前版本的实际格式、文件名和总大小；未知省略 |
+| `width?`、`height?` | 当前版本按显示方向的尺寸，必须同时给正整数或同时省略 |
+
+- 同一实际版本可以同时用于预览和原件，只返回一项、同时标记两种用途；宿主共用下载和缓存。
+- 最多 16 项、最多一份原件，每项至少有一种用途。空列表表示当前没有可读取版本。校验入口是 `ResourceVariants::validate`。
+- 聊天流和查看层只从 `preview` 中按显示长边选择合适档位；下载原图与另存原件只使用 `original`。没有预览或原件时明确返回不支持/不可用，不静默换用途。平台已经生成预览时直接提供，不要求前端解码原件或重复转码。
+- 分段流身份必须包含 `conversationId`、`messageId`、`key`、`kind` 和 `variant`，可用 `ResourcesReadParams::segment_key()`；预览与原件的字节、长度、eof 和状态不得串用。
+- 版本编号对应的字节不能在同一资源内变成另一档内容。平台有新档位时使用新的编号；宿主记住说明供重启/离线读取，手动重试时重新查询。
+- 描述需要查询平台时遵守读取计数/放行规则。插件仍自行鉴权、验证真实消息归属和下载地址；平台地址与密钥不交给前端。
 
 ### 9.2 上传（发送附件之前）
 
