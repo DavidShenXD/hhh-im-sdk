@@ -424,6 +424,11 @@ pub enum Outgoing {
         /// 资源键。
         key: String,
     },
+    /// 目录中的原生贴纸；独立一条，不与文字、附件混发。
+    Sticker {
+        /// 当前账号内插件给出的贴纸编号。
+        id: String,
+    },
     /// 文件（`key` 来自 uploads/finish）。
     File {
         /// 资源键。

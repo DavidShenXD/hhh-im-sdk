@@ -520,7 +520,7 @@ v13 起每一步都可以带 `links: [{id, label}]`（另一种做法，画成�
 | `messages/get` | `conversationId`、`messageId` | `Message` | `messages.get` |
 | `reactions/list` | `conversationId`、`messageId`、`limit`（不超过 50）、`cursor`? | `{items: Reaction[], next?}` | `reactions.list` |
 | `emoji/catalog` | 无 | `{emojis: Emoji[], categories?, tones?, updatedAtMs}` | `reactions.catalog` |
-| `conversations/recentActivity` | `sinceMs`、`pagesMax` | `{items: [{conversationId, kind, firstMs, latestMs, peerId?, conversation?}], complete}`：这段时间里有人（不算机器人、应用、经接口发的）发过消息的会话，每个会话一项，按最新一条从新到旧；只用来认会话，不交出消息内容；`peerId` 是私聊的对方；`conversation`（v15，可选）是群与频道的资料（§7.2 的 Conversation），程序手边正好有时给，宿主就不再为它读一次 `conversations/get`，私聊不给；翻满 `pagesMax` 页还没到起点时 `complete` 为假。一次至多 1000 项（v12） | `conversations.recentActivity` |
+| `conversations/recentActivity` | `sinceMs`、`pagesMax`、`skip?`、`firstPageLimit?` | `{items: [{conversationId, kind, firstMs, latestMs, peerId?, conversation?, firstPage?}], complete}`：这段时间里有人（不算机器人、应用、经接口发的）发过消息的会话，每个会话一项，按最新一条从新到旧；`peerId` 是私聊的对方；`conversation`（v15，可选）是群与频道的资料（§7.2 的 Conversation），程序手边正好有时给，宿主就不再为它读一次 `conversations/get`，私聊不给；翻满 `pagesMax` 页还没到起点时 `complete` 为假。一次至多 1000 项（v12）。`skip`（v43，可选）是宿主已在同步的会话编号，程序可以不核对、不报（报了宿主照旧滤掉）。`firstPageLimit`（v43，可选）是宿主要的第一页至多几条，给了程序才可以附 `firstPage {items, more}`：会话主消息流最新的至多这么多条，不带时间条件，与 `messages/list`（`newestFirst`、同样条数）读到的同一批、同样翻译、页内从旧到新，`more` 为真表示平台上还有更早的；程序核对时正好读到了会话最新的消息才附，不为它多发请求；宿主第一次同步这个会话、本地还没有它的消息时就用这页，不再读一遍。消息内容只经 `firstPage` 交出 | `conversations.recentActivity` |
 
 - `messages/list` 的翻页规则同 hhh-im 的 `MessageQuery`：`newestFirst` 为真时，从最新往更早翻。
 - **发送前申请额度**（可选）：程序在 `initialize` 声明 `readRequestGating: true` 后，支持此扩展的宿主给上表读取的参数添加 `_meta: {readPermit: "不透明凭据"}`。程序每次发平台 HTTP 读取前，先反向请求 `requests/acquire {permit: "该凭据"}`，只有收到 `{granted: true}` 才能发送这一条；收到错误、空回执或连接断开时停止，不可自行补发。凭据只属于当前连接里的这次读取，不能保存、跨调用复用或用于写操作。
@@ -752,6 +752,7 @@ JSON-RPC 的 `error.code` 按下表取值；`error.data` 里写明错误分类�
 | 登录时填的每个值、回调地址（v12） | 8 KiB |
 | `session/notice`（v12） | 至多 20 条，每条至多 200 字（超出的那条不显示） |
 | `conversations/recentActivity` 的结果（v12） | 一次至多 1000 项（多出的不用） |
+| `conversations/recentActivity` 附的第一页（v43） | 每页至多 `firstPageLimit` 条（多了整页不用，会话照常报）；一次结果里所有 `firstPage` 按 JSON 合计至多 2 MiB（单条消息上限的一半），装不下的项不附 |
 | `retranslateRules`（v12） | 至多 32 条（重复的名字不用） |
 | 平台说明里的正则（`textPattern` 等，v12） | 1 KiB |
 | `editDraft`（v12） | 块数同发送 |
@@ -810,7 +811,7 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 7. 取消有效，`ping` 及时回复，`shutdown` 后 5 秒内退出。
 8. 发送：只读程序会拒绝发送；拿不准的发送回 `unknown`，并且不重发。这一项需要 `--allow-send`。
 9. 凭据：程序先存后用；宿主拒绝保存时，程序保留旧凭据。
-10. v12 的新声明（没声明的跳过）：`userAdjustable`、`editsByContent` 的取值宿主认得出；`retranslateRules` 名字不重复；`emoji.textPattern` 能编译、有一个括号；`logoInk` 是合法的外框；`loginMethods` 的类型认得出、编号不重复、不超过 8 种，`callbackPath` 在这个 IM 自己的 `/hhh-friend-im/<平台编号>/` 下面；声明了 `conversations.recentActivity` 就要能回合法结果，声明了 `session.renew` 就要能答。
+10. v12 的新声明（没声明的跳过）：`userAdjustable`、`editsByContent` 的取值宿主认得出；`retranslateRules` 名字不重复；`emoji.textPattern` 能编译、有一个括号；`logoInk` 是合法的外框；`loginMethods` 的类型认得出、编号不重复、不超过 8 种，`callbackPath` 在这个 IM 自己的 `/hhh-friend-im/<平台编号>/` 下面；声明了 `conversations.recentActivity` 就要能回合法结果（v43：自检照宿主的问法带 `firstPageLimit`，附的 `firstPage` 不超过要的条数与合计预算），声明了 `session.renew` 就要能答。
 11. v13 的新声明（没声明的跳过）：`actions` 的位置认得出、编号合规不重复、文字不超长、不超过 16 项；声明了账号级操作、登录着时 `actions/start` 要回流程编号；声明了 `host` 登录方式时提示只有宿主允许的（带官方签名的）程序能用。
 12. v15：声明了 `people.get` 时，问一个不存在的编号（声明了 `people.bots` 时人与机器人各一个），结果读得懂、同一个编号不会既在 `found` 又在 `missing`；`people.bots` 要先声明 `people.get`、`people.batchMax` 在 1–2000 之间（随能力组合一起查）。
 13. v31（没声明的跳过）：`emoji.textTemplate` 合写法规则；声明了 `reactions.catalog` 时读一次目录：同时声明了 `textPattern` 的，能写进文字的每个表情按写法写出来，`textPattern` 要整段认出、认出的名字或编号（按占位）对得回这个表情；分类的 `icon` 要在宿主图标库里。没登录读不到目录时跳过。
@@ -903,6 +904,23 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 - 宿主将目录与当前组成员分别做有界完整读取：100 页/1000 组、500 页/10000 会话；全部成功才替换内存，失败保留旧内容可重试。读取中收到失效后再补读一次；进入、事件流重连或 resync 同样补读。账号或来源切换取消旧读，不接受迟到结果。不新增持久化文件或游标账本。
 - 旧 SDK 插件可按同一正式 JSON 形状实现增量；SDK 导出/发布仍独立进行，不假称旧标签已包含新 Rust 类型。执行类型见 `hhh-im-protocol/src/groups.rs`，兼容与真实 provider/hub 测试见 `provider_groups.rs`。
 
+## 账号贴纸、表情包与收藏
+
+这些是可选能力，主版本仍为 1。`capabilities.stickers` 的 `packs`、`favorites`、`favoriteAdd`、`favoriteRemove`、`send` 均默认 false、独立声明；没有实现的不能声明。这里列的是账号已有的内容，不包含表情商店或上传管理；不混入 `emoji/catalog` 与消息回应。
+
+| 请求 | 参数 | 返回与门禁 |
+|---|---|---|
+| `stickers/packs` | `{limit,cursor?}` | `StickerPage<StickerPack>`，须 `packs` |
+| `stickers/list` | `{packId,limit,cursor?}` | `StickerPage<Sticker>`，须 `packs` |
+| `stickers/favorites` | `{limit,cursor?}` | `StickerPage<Sticker>`，须 `favorites` |
+| `stickers/favorite` | `{id,favorite}` | `{}`；目标状态为 true 须 `favoriteAdd`、false 须 `favoriteRemove`；幂等设定目标状态，不是反转 |
+| `stickers/image` | `{key,offset,length}` | 同资源分段读取的 `ResourceChunk`；须 `packs` 或 `favorites` |
+
+`StickerPack` 为 `{id,name,cover?}`，cover 为图片键；`Sticker` 为 `{id,name,imageKey,favorite?}`，收藏状态未知时省略；`StickerPage` 为 `{items,next?}`，无 next 表示读完。编号、包编号、图片键、游标均为账号内不透明字符串；稳定发送编号不可拿远端 URL 或上传键冒充。图片变化须换图片键。空、控制字符或超过 `STICKER_ID_MAX`（512 字节）的编号/游标无效；名称也不超过 512 字节。一页 limit 为 1–`STICKER_PAGE_MAX`（100），回包不超过请求上限，next 不得重复当前游标。目录缺权限、读取失败要报错，不伪装空结果；图片沿用宿主表情图片总大小预算。
+
+原生发送使用 `messages/send`，content 只能有一项 `{"type":"sticker","id":"<目录里的发送编号>"}`，须 `stickers.send`，不需要 `send.text`。目标、话题、操作编号和 accepted/unknown 沿用现有发送协议；unknown 不自动重发，不可通过转换为文件上传规避结果语义。有 `stickers.send` 的插件不是只读插件。收藏失败保持原状态，宿主可让用户明确重试。
+
+线上类型在 `src/stickers.rs`、参数在 `src/method.rs`；示例插件提供通用的目录、收藏与发送数据。旧插件不声明时全部关闭；新插件依赖包含这些类型的 SDK 后再接入，SDK 和插件发布独立进行。
 
 ## 变更记录
 
@@ -920,3 +938,4 @@ hhh-im-check <清单路径> [--mock] [--live --read-only] [--allow-send <会话�
 - 2026-10-22（契约 v32，可选的加法，主版本仍是 1）：能力 `perf`、`perf/start` / `perf/stop` 请求与 `perf/report` 通知（§11.6）、自报上限（§14）、自检第 15 项；SDK `runtime` 自动声明并上报。
 - 2026-10-25（契约 v37，程序不用改）：登录窗口截到跳转后窗口里换成宿主的收据页，登录有了结局再关；本机回调的页面换成同一张收据页；示例插件页面换成收据页版式。
 - 2026-10-25（契约 v36，可选的加法，主版本仍是 1）：登录步骤 `loginWindow`（§6.1“登录窗口”：桌面版无痕登录窗口，截到 `capture` 开头的跳转经 `login/callback` 交给程序）；协议包 `login_window` 模块；§14 新预算；`hhh-im-check --login` 与自检第 16 项。
+- 2026-10-26（契约 v43，见 hhh-im client 契约 v41；可选的加法，主版本仍是 1）：`conversations/recentActivity` 的参数 `skip`、`firstPageLimit` 与结果项 `firstPage {items, more}`（会话发现读到的最新一页交给宿主当第一次读取）；§14 新预算；自检第 10 项核对附的第一页。协议包 `ActivityItem` 加字段、不再实现 `Eq`，直接构造它与 `RecentActivityParams` 的程序升级时补上新字段。

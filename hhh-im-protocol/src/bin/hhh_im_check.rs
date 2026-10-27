@@ -394,6 +394,7 @@ async fn run(args: Args) -> i32 {
     check_v12_calls(&conn, &mut report, &caps, online).await;
     check_v13_calls(&conn, &mut report, &init, online).await;
     check_v31_calls(&conn, &mut report, &platform, &caps, online).await;
+    check_stickers(&conn, &mut report, &caps, online).await;
     if caps.perf {
         check_perf(&conn, &mut report, &collected).await;
     }
@@ -424,7 +425,7 @@ async fn run(args: Args) -> i32 {
             check_send(&conn, &mut report, conv, caps.agent_attribution.send).await;
         }
         (Some(_), _) => report.skip("发送检查", "插件未声明发文字能力"),
-        (None, Some(send)) if send.is_read_only() => {
+        (None, Some(_)) if caps.is_read_only() => {
             report.pass("只读插件不声明发送能力");
         }
         (None, _) => report.skip("发送检查", "未给 --allow-send，跳过真实发送"),
@@ -874,6 +875,75 @@ fn check_v31_declarations(report: &mut Report, platform: &PlatformDesc) {
     }
 }
 
+/// 只读检查声明的账号贴纸目录；不会增删收藏或发送消息。
+async fn check_stickers(
+    conn: &Arc<Connection>,
+    report: &mut Report,
+    caps: &Capabilities,
+    online: bool,
+) {
+    use hhh_im_protocol::{Sticker, StickerPack, StickerPage, valid_sticker_id};
+    let mut pack = None;
+    for (name, method, enabled) in [
+        ("表情包目录", "stickers/packs", caps.stickers.packs),
+        (
+            "收藏贴纸目录",
+            "stickers/favorites",
+            caps.stickers.favorites,
+        ),
+        ("包内贴纸目录", "stickers/list", caps.stickers.packs),
+    ] {
+        if !enabled {
+            report.skip(name, "未声明可选能力");
+            continue;
+        }
+        if !online {
+            report.skip(name, "尚未登录，需登录后补验");
+            continue;
+        }
+        if method == "stickers/list" && pack.is_none() {
+            report.skip(name, "账号没有表情包样本");
+            continue;
+        }
+        let mut args = json!({"limit":10});
+        if method == "stickers/list" {
+            args["packId"] = json!(pack);
+        }
+        match call_t(conn, method, args, Duration::from_secs(30)).await {
+            Ok(value) => {
+                let valid = if method == "stickers/packs" {
+                    serde_json::from_value::<StickerPage<StickerPack>>(value).is_ok_and(|page| {
+                        pack = page.items.first().map(|item| item.id.clone());
+                        page.items.len() <= 10
+                            && page.next.as_deref().is_none_or(valid_sticker_id)
+                            && page.items.iter().all(|item| {
+                                valid_sticker_id(&item.id)
+                                    && item.name.len() <= 512
+                                    && item.cover.as_deref().is_none_or(valid_sticker_id)
+                            })
+                    })
+                } else {
+                    serde_json::from_value::<StickerPage<Sticker>>(value).is_ok_and(|page| {
+                        page.items.len() <= 10
+                            && page.next.as_deref().is_none_or(valid_sticker_id)
+                            && page.items.iter().all(|item| {
+                                valid_sticker_id(&item.id)
+                                    && valid_sticker_id(&item.image_key)
+                                    && item.name.len() <= 512
+                            })
+                    })
+                };
+                if valid {
+                    report.pass(name);
+                } else {
+                    report.fail(name, "目录字段或分页预算不合格");
+                }
+            }
+            Err(error) => report.fail(name, error),
+        }
+    }
+}
+
 /// 契约 provider-protocol v31：读一次表情目录，核对它与写法、分类图标对得上（[`check_v31_catalog`]）。
 async fn check_v31_calls(
     conn: &Arc<Connection>,
@@ -1013,20 +1083,39 @@ async fn check_v12_calls(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
             - 86_400_000;
+        // 照宿主的问法要第一页（v43），附上的要守条数与合计大小。
+        const FIRST_PAGE_LIMIT: usize = 50;
         match call_t(
             conn,
             "conversations/recentActivity",
-            json!({ "sinceMs": since, "pagesMax": 1 }),
+            json!({ "sinceMs": since, "pagesMax": 1, "firstPageLimit": FIRST_PAGE_LIMIT }),
             Duration::from_secs(30),
         )
         .await
         {
             Ok(v) => {
                 match serde_json::from_value::<hhh_im_protocol::method::RecentActivityResult>(v) {
-                    Ok(r) if r.items.iter().all(|i| !i.conversation_id.is_empty()) => {
-                        report.pass("会话发现能调");
+                    Ok(r) if r.items.iter().any(|i| i.conversation_id.is_empty()) => {
+                        report.fail("会话发现能调", "有一项没有会话编号");
                     }
-                    Ok(_) => report.fail("会话发现能调", "有一项没有会话编号"),
+                    Ok(r) => {
+                        let pages: Vec<_> = r
+                            .items
+                            .iter()
+                            .filter_map(|i| i.first_page.as_ref())
+                            .collect();
+                        let bytes: usize = pages
+                            .iter()
+                            .map(|p| serde_json::to_vec(p).map_or(usize::MAX, |b| b.len()))
+                            .fold(0, usize::saturating_add);
+                        if pages.iter().any(|p| p.items.len() > FIRST_PAGE_LIMIT) {
+                            report.fail("会话发现能调", "附上的第一页超过了要的条数");
+                        } else if bytes > hhh_im_protocol::budget::RECENT_ACTIVITY_PAGES_BYTES_MAX {
+                            report.fail("会话发现能调", "附上的第一页合起来超过预算");
+                        } else {
+                            report.pass("会话发现能调");
+                        }
+                    }
                     Err(e) => report.fail("会话发现能调", format!("结果格式不对：{e}")),
                 }
             }

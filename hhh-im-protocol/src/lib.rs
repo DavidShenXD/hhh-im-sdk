@@ -25,6 +25,8 @@ pub mod method;
 pub mod platform;
 pub mod release;
 pub mod rpc;
+mod stickers;
+pub use stickers::*;
 pub mod types;
 
 #[cfg(feature = "transport")]
@@ -121,6 +123,9 @@ pub mod budget {
     pub const NOTICE_MAX_CHARS: usize = 200;
     /// `conversations/recentActivity` 一次最多几项（多出的不用）。
     pub const RECENT_ACTIVITY_ITEMS_MAX: usize = 1000;
+    /// `conversations/recentActivity` 一次结果里所有 `firstPage` 合起来最多多少字节（按 JSON 计，v43）：
+    /// 给其余各项与信封留出一半，整条结果不超过 [`MESSAGE_MAX_BYTES`]。
+    pub const RECENT_ACTIVITY_PAGES_BYTES_MAX: usize = MESSAGE_MAX_BYTES / 2;
     /// 最多声明几条重译规则。
     pub const RETRANSLATE_RULES_MAX: usize = 32;
     /// 平台说明里的正则（表情写法）最长多少字节。

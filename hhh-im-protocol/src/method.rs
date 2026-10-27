@@ -103,6 +103,17 @@ pub enum Method {
     ReactionsList,
     /// 表情目录。
     EmojiCatalog,
+    /// `stickers/packs`：贴纸目录、收藏与图片。
+    StickersPacks,
+    /// `stickers/list`：贴纸目录、收藏与图片。
+    StickersList,
+    /// `stickers/favorites`：贴纸目录、收藏与图片。
+    StickersFavorites,
+    /// `stickers/favorite`：贴纸目录、收藏与图片。
+    StickersFavorite,
+    /// `stickers/image`：贴纸目录、收藏与图片。
+    StickersImage,
+
     // —— 资源（宿主→插件）——
     /// 读消息资源一段。
     ResourcesRead,
@@ -200,6 +211,12 @@ impl Method {
             Method::MessagesGet => "messages/get",
             Method::ReactionsList => "reactions/list",
             Method::EmojiCatalog => "emoji/catalog",
+            Method::StickersPacks => "stickers/packs",
+            Method::StickersList => "stickers/list",
+            Method::StickersFavorites => "stickers/favorites",
+            Method::StickersFavorite => "stickers/favorite",
+            Method::StickersImage => "stickers/image",
+
             Method::ResourcesRead => "resources/read",
             Method::AvatarsRead => "avatars/read",
             Method::EmojiImage => "emoji/image",
@@ -279,6 +296,11 @@ impl Method {
             Method::MessagesGet,
             Method::ReactionsList,
             Method::EmojiCatalog,
+            Method::StickersPacks,
+            Method::StickersList,
+            Method::StickersFavorites,
+            Method::StickersFavorite,
+            Method::StickersImage,
             Method::ResourcesRead,
             Method::AvatarsRead,
             Method::EmojiImage,
@@ -2000,6 +2022,12 @@ pub struct RecentActivityParams {
     pub since_ms: i64,
     /// 一次最多翻几页。
     pub pages_max: u16,
+    /// 宿主已经在同步的会话（v43，可选）：程序可以不核对、不报它们；宿主照旧滤掉报来的。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip: Vec<String>,
+    /// 宿主要的第一页至多几条（v43，可选）：给了，程序才可以在结果项里附上 [`ActivityItem::first_page`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_page_limit: Option<u16>,
 }
 
 /// `conversations/recentActivity` 结果。
@@ -2014,8 +2042,8 @@ pub struct RecentActivityResult {
     pub complete: bool,
 }
 
-/// 一段时间里有人发过消息的一个会话（只用来认会话，不交出消息内容）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 一段时间里有人发过消息的一个会话。消息内容只经 [`ActivityItem::first_page`] 交出。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActivityItem {
     /// 会话编号。
@@ -2033,6 +2061,24 @@ pub struct ActivityItem {
     /// `conversations/get`；私聊不给（名字与头像是对方本人的，宿主另读）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<Conversation>,
+    /// 这个会话最新的一页消息（v43，可选）：程序核对时正好读到了会话最新的消息才给，宿主第一次同步它时就用这页，
+    /// 不再读一遍。宿主没给 `firstPageLimit` 时不给；一次结果里所有 `firstPage` 合起来不超过
+    /// [`crate::budget::RECENT_ACTIVITY_PAGES_BYTES_MAX`]，装不下的项不附（按从新到旧的顺序先附前面的）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_page: Option<FirstPage>,
+}
+
+/// 会话最新的一页消息（[`ActivityItem::first_page`]，v43）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FirstPage {
+    /// 会话主消息流里最新的至多 `firstPageLimit` 条，不带时间条件：与 `messages/list`（`newestFirst`）读到的同一批、
+    /// 同样翻译，页内从旧到新。
+    #[serde(default)]
+    pub items: Vec<Message>,
+    /// 平台上还有比这页更早的消息。
+    #[serde(default)]
+    pub more: bool,
 }
 
 /// `messages/retranslate` 参数（protocol-v1 §10.1）。
@@ -2617,6 +2663,23 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(activity.items[0].peer_id.as_deref(), Some("u2"));
+        // v43 的新字段都可选：旧插件的结果没有 firstPage，旧宿主的参数没有 skip / firstPageLimit，没给的不写出去。
+        assert!(activity.items[0].first_page.is_none());
+        let old: RecentActivityParams =
+            serde_json::from_value(json!({ "sinceMs": 1, "pagesMax": 2 })).unwrap();
+        assert!(old.skip.is_empty() && old.first_page_limit.is_none());
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            json!({ "sinceMs": 1, "pagesMax": 2 })
+        );
+        let paged: RecentActivityResult = serde_json::from_value(json!({
+            "items": [{ "conversationId": "c1", "kind": "group", "firstMs": 1, "latestMs": 2,
+                        "firstPage": { "items": [], "more": true } }],
+            "complete": true
+        }))
+        .unwrap();
+        let page = paged.items[0].first_page.as_ref().unwrap();
+        assert_eq!((page.items.len(), page.more), (0, true));
     }
 
     #[test]
@@ -3037,4 +3100,45 @@ mod tests {
             );
         }
     }
+}
+
+/// stickers/packs、stickers/favorites 的分页参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StickerPageParams {
+    /// 1 到 STICKER_PAGE_MAX。
+    pub limit: u16,
+    /// 上次返回的游标。
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+/// stickers/list 的参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StickersListParams {
+    /// 包编号。
+    pub pack_id: String,
+    /// 分页。
+    #[serde(flatten)]
+    pub page: StickerPageParams,
+}
+/// stickers/favorite：设置目标状态，重复设置应幂等；成功回空对象。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StickersFavoriteParams {
+    /// 贴纸编号。
+    pub id: String,
+    /// true 收藏，false 取消收藏。
+    pub favorite: bool,
+}
+/// stickers/image：结果复用 ResourceChunk；只接受目录中图片/封面键。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StickersImageParams {
+    /// 图片键。
+    pub key: String,
+    /// 字节偏移。
+    pub offset: u64,
+    /// 分段长度。
+    pub length: u64,
 }

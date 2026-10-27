@@ -293,6 +293,7 @@ struct State {
     messages: Vec<Value>,
     /// 消息上的表情回应（第一条上有一个目录里的“赞”、一个目录外的 `wave`；宿主点的加在后面）。
     reactions: Vec<Value>,
+    favorites: Vec<String>,
     /// 每个会话上次被读的时间（标准错误里写读取间隔用）。
     last_read: BTreeMap<String, i64>,
     /// 刚开始的登录要推的一步（“打开登录页”或“登录窗口”，回复 `login/start` 之后推）：流程编号与这一步。
@@ -337,6 +338,7 @@ fn main() {
         HostMethod::Off
     };
     let state = Arc::new(Mutex::new(State {
+        favorites: Vec::new(),
         id,
         plain: has("--plain"),
         callback_path: value_of("--callback-path"),
@@ -543,18 +545,71 @@ fn handle(
                 .retain(|r| r["id"] != id.as_str());
             Ok(json!({}))
         }
+        "stickers/packs" => {
+            if std::path::Path::new("deny-stickers").exists() {
+                return Err(error("unavailable", "示例表情包暂时不可用"));
+            }
+            Ok(
+                json!({"items":[{"id":"sample-pack","name":"示例表情包","cover":"smile"}],"next":null}),
+            )
+        }
+        "stickers/list" | "stickers/favorites" => {
+            if std::path::Path::new("deny-stickers").exists() {
+                return Err(error("unavailable", "示例贴纸暂时不可用"));
+            }
+            let state = state.lock().unwrap();
+            let from = params["cursor"]
+                .as_str()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            let limit = params["limit"].as_u64().unwrap_or(48).min(100) as usize;
+            let all: Vec<_> = (0..60).filter(|i| method == "stickers/list" || state.favorites.contains(&format!("s-{i}"))).map(|i| json!({"id":format!("s-{i}"),"name":format!("贴纸 {}",i+1),"imageKey":if i%2==0 {"smile"} else {"thumbsup"},"favorite":state.favorites.contains(&format!("s-{i}"))})).collect();
+            let items: Vec<_> = all.iter().skip(from).take(limit).cloned().collect();
+            let next = (from + items.len() < all.len()).then(|| (from + items.len()).to_string());
+            Ok(json!({"items":items,"next":next}))
+        }
+        "stickers/favorite" => {
+            if std::path::Path::new("deny-favorite").exists() {
+                return Err(error("permissionDenied", "示例收藏操作被拒绝"));
+            }
+            let id = params["id"].as_str().unwrap_or("").to_owned();
+            let mut state = state.lock().unwrap();
+            state.favorites.retain(|v| v != &id);
+            if params["favorite"].as_bool() == Some(true) {
+                state.favorites.push(id);
+            }
+            Ok(json!({}))
+        }
+        "stickers/image" => Ok(chunk(
+            params,
+            if params["key"] == "smile" {
+                SMILE_PNG
+            } else {
+                THUMBSUP_PNG
+            },
+        )),
         "emoji/catalog" => Ok(json!({
-            "emojis": [ { "emojiType": "thumbsup", "name": "赞" }, { "emojiType": "smile", "name": "微笑" } ],
-            "categories": [], "updatedAtMs": 1
+            "emojis": [ { "emojiType": "thumbsup", "name": "赞" }, { "emojiType": "smile", "name": "微笑" },
+                { "emojiType": "thumbsup-sun", "name": "赞（晒黑）", "toneOf": { "base": "thumbsup", "tone": "sun" } } ],
+            "tones": [{ "id": "sun", "name": "晒黑" }],
+            "categories": [], "updatedAtMs": 2
         })),
         "emoji/image" => match params["emojiType"].as_str() {
-            Some("thumbsup") => Ok(chunk(params, THUMBSUP_PNG)),
+            Some("thumbsup" | "thumbsup-sun") => Ok(chunk(params, THUMBSUP_PNG)),
             Some("smile") => Ok(chunk(params, SMILE_PNG)),
             Some("wave") => Ok(chunk(params, WAVE_PNG)),
             _ => Err(error("notFound", "示例 IM 没有这个表情的图。")),
         },
         "resources/read" => Ok(chunk(params, SMILE_PNG)),
-        "messages/send" => Ok(send_message(params, state)),
+        "messages/send" => {
+            if std::path::Path::new("deny-send").exists() {
+                return Err(error("permissionDenied", "示例：发送被拒绝"));
+            }
+            if std::path::Path::new("unknown-send").exists() {
+                return Ok(json!({"state":"unknown","reason":"示例：发送结果尚未确认"}));
+            }
+            Ok(send_message(params, state))
+        }
         "messages/edit" => edit_message(params, state),
         "messages/retranslate" => Ok(retranslate(params, state)),
         _ => Err(error("unsupported", "示例 IM 不支持这件事。")),
@@ -572,7 +627,7 @@ fn initialize(state: &State) -> Value {
         "actions": { "reply": true, "thread": true, "react": true, "recall": null, "edit": { "own": true, "perMessage": true } },
         "pageMax": 50,
         "reads": { "perSecond": 5, "perMinute": 120 },
-        "emoji": { "unlisted": { "placeholderLabel": "表情", "guess": true }, "textPattern": "\\{([^{}\\r\\n]{1,12})\\}", "whiteBackground": true },
+        "emoji": { "unlisted": { "placeholderLabel": "表情", "guess": true }, "textPattern": "\\{([^{}\\r\\n]{1,12})\\}", "whiteBackground": true, "textTemplate": "{{type}}" },
         "discovery": { "fastestSecs": 15, "pages": 2, "coldPages": 4 },
         "editsByContent": ["text"],
         "retranslateRules": rules,
@@ -618,6 +673,7 @@ fn initialize(state: &State) -> Value {
         "provider": { "id": state.id, "name": "示例 IM", "version": "0.1.0" },
         "platform": platform,
         "capabilities": {
+            "stickers": {"packs": true, "favorites": true, "favoriteAdd": true, "favoriteRemove": true, "send": true},
             "conversations": { "list": false, "search": false, "members": false, "findDirect": false, "recentActivity": true },
             "messages": { "list": true, "get": true },
             "people": { "get": true, "search": false },
@@ -633,6 +689,13 @@ fn initialize(state: &State) -> Value {
         "settings": settings,
         "loginMethods": login_methods
     });
+    // 用于核对旧插件未声明贴纸能力时，宿主仍只显示小表情。
+    if std::path::Path::new("no-stickers").exists() {
+        result["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stickers");
+    }
     // 插件操作（v13）：账号级的进管理菜单，会话级的进会话菜单——群成员、邀请、退出只给群，删除会话（v19）不写种类、
     // 私聊与群都有。`--plain` 不声明。
     if !state.plain {
@@ -2083,14 +2146,16 @@ fn list_messages(params: &Value, state: &Arc<Mutex<State>>) -> Value {
 
 fn send_message(params: &Value, state: &Arc<Mutex<State>>) -> Value {
     let op = params["operationId"].as_str().unwrap_or("op");
-    let conversation = params["conversationId"].as_str().unwrap_or("c-team");
+    let conversation = params["target"]["conversationId"]
+        .as_str()
+        .unwrap_or("c-team");
     let text: String = params["content"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|block| block["text"].as_str())
         .collect();
-    let sent = message(
+    let mut sent = message(
         &format!("sent-{op}"),
         conversation,
         "me",
@@ -2098,7 +2163,31 @@ fn send_message(params: &Value, state: &Arc<Mutex<State>>) -> Value {
         &text,
         true,
     );
-    state.lock().unwrap().messages.push(sent.clone());
+    if let Some(id) = params["content"]
+        .as_array()
+        .and_then(|v| v.first())
+        .filter(|v| v["type"] == "sticker")
+        .and_then(|v| v["id"].as_str())
+    {
+        sent["content"] = json!([{"type":"resource","resource":{"key":id,"kind":"sticker"},"width":120,"height":120}]);
+        sent.as_object_mut().unwrap().remove("editDraft");
+    }
+    let mut state = state.lock().unwrap();
+    if params["target"]["inThread"] == true {
+        let target = state
+            .messages
+            .iter()
+            .find(|message| message["id"] == params["target"]["messageId"]);
+        let root = target
+            .and_then(|message| message["thread"]["rootId"].as_str())
+            .or_else(|| params["target"]["messageId"].as_str())
+            .unwrap_or("m-1");
+        let thread = target
+            .and_then(|message| message["thread"]["id"].as_str())
+            .unwrap_or(root);
+        sent["thread"] = json!({"id":thread,"rootId":root,"inThread":true});
+    }
+    state.messages.push(sent.clone());
     json!({ "state": "accepted", "message": sent })
 }
 

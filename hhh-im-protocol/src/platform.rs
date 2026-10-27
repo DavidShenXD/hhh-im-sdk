@@ -656,6 +656,9 @@ pub struct Capabilities {
     /// 可选会话分组，与列群能力独立。
     #[serde(default, skip_serializing_if = "crate::groups::GroupCaps::is_empty")]
     pub conversation_groups: crate::groups::GroupCaps,
+    /// 表情包与远端收藏的独立能力。
+    #[serde(default, skip_serializing_if = "crate::StickerCaps::is_empty")]
+    pub stickers: crate::StickerCaps,
     /// 是否能跨账号保存／读取伙伴代发署名；旧插件不声明则全部关闭。
     #[serde(default, skip_serializing_if = "AgentAttributionCaps::is_empty")]
     pub agent_attribution: AgentAttributionCaps,
@@ -1118,7 +1121,7 @@ impl Capabilities {
 
     /// 是不是只读连接（没有发送能力）。
     pub fn is_read_only(&self) -> bool {
-        self.send.as_ref().is_none_or(SendCaps::is_read_only)
+        !self.stickers.send && self.send.as_ref().is_none_or(SendCaps::is_read_only)
     }
 }
 
